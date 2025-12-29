@@ -71,7 +71,7 @@ export function initLiquidBackground() {
       uv -= 0.5;
       uv.x *= uResolution.x / uResolution.y;
 
-      float t = uTime * 0.15;
+      float t = uTime * 0.35;
 
       vec2 p = uv * 2.0;
       float n1 = fbm(p + vec2(t, 0.0));
@@ -79,22 +79,31 @@ export function initLiquidBackground() {
       float n = fbm(p + vec2(n1, n2));
 
       // palette close to your purple-ish scheme
-      vec3 col1 = vec3(0.02, 0.02, 0.07);      // deep background
-      vec3 col2 = vec3(0.36, 0.36, 0.85);      // purple/indigo
-      vec3 col3 = vec3(0.66, 0.44, 0.96);      // light violet
-      vec3 col4 = vec3(0.97, 0.60, 0.37);      // warm accent (subtle)
+      // --- PURPLE → ORANGE LIQUID PALETTE ---
+      // --- RADICAL PURPLE ↔ ORANGE PALETTE ---
+      vec3 col1 = vec3(0.03, 0.00, 0.18);  // deeper, darker midnight base
+      vec3 col2 = vec3(0.52, 0.30, 1.00);  // neon violet
+      vec3 col3 = vec3(0.88, 0.40, 1.00);  // electric magenta highlight
+      vec3 col4 = vec3(1.10, 0.65, 0.10);  // hot orange (slightly over-driven)
+      vec3 col5 = vec3(1.30, 0.32, 0.00);  // molten red-orange (over-saturated)
 
-      float band1 = smoothstep(0.2, 0.7, n);
-      float band2 = smoothstep(0.4, 0.9, n);
-      float band3 = smoothstep(0.6, 1.0, n);
 
+      // bands define how colors blend through the noise
+      float band1 = smoothstep(0.10, 0.60, n);
+      float band2 = smoothstep(0.40, 0.85, n);
+      float band3 = smoothstep(0.55, 0.85, n);
+      float band4 = smoothstep(0.65, 1.15, n);
+
+      // build gradient progression
       vec3 color = col1;
-      color = mix(color, col2, band1);
-      color = mix(color, col3, band2);
-      color = mix(color, col4, band3 * 0.3);
+      color = mix(color, col2, band1*1.2);
+      color = mix(color, col3, band2*1.2);
+      color = mix(color, col4, band3 * 1.5); 
+      color = mix(color, col5, band4 * 1.7);
+
 
       float radius = length(uv);
-      float vignette = smoothstep(0.95, 0.2, radius);
+      float vignette = smoothstep(1.2, 0.2, radius);
       color *= vignette;
 
       gl_FragColor = vec4(color, 1.0);
