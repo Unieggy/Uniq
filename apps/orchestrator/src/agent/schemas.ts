@@ -3,6 +3,7 @@
  */
 
 import { z } from 'zod';
+const zOptString = z.string().optional().nullable().transform(v => v ?? undefined);
 
 export const ActionSchema = z.discriminatedUnion('type', [
   z.object({
@@ -12,24 +13,26 @@ export const ActionSchema = z.discriminatedUnion('type', [
   }),
   z.object({
     type: z.literal('DOM_CLICK'),
-    selector: z.string().optional(),
+    selector: zOptString,
+    name: zOptString,
+    description: zOptString,
     role: z.enum(['button', 'link', 'textbox', 'checkbox', 'radio']).optional(),
-    name: z.string().optional(),
-    description: z.string().optional(),
+
   }),
   z.object({
     type: z.literal('DOM_FILL'),
-    selector: z.string().optional(),
-    role: z.enum(['textbox']).optional(),
-    name: z.string().optional(),
+    selector: zOptString,
+    name: zOptString,
+    description: zOptString,
     value: z.string(),
-    description: z.string().optional(),
+    role: z.enum(['textbox']).optional(),
   }),
   z.object({
     type: z.literal('WAIT'),
     duration: z.number().optional(),
-    until: z.string().optional(), // e.g., "networkidle", "load"
-    description: z.string().optional(),
+    until: zOptString,
+    description: zOptString,
+
   }),
   z.object({
     type: z.literal('ASK_USER'),
@@ -45,6 +48,18 @@ export const ActionSchema = z.discriminatedUnion('type', [
     type: z.literal('DONE'),
     reason: z.string().optional(),
   }),
+  z.object({
+    type:z.literal('VISION_FILL'),
+    regionId:z.string(),
+    value:z.string(),
+    description:z.string().optional(),
+  }),
+  z.object({
+    type: z.literal('KEY_PRESS'),
+    key: z.string(), // e.g. "Enter"
+    description: z.string().optional(),
+  }),
+
 ]);
 export type Action = z.infer<typeof ActionSchema>;
 

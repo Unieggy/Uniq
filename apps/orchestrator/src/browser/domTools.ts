@@ -100,9 +100,11 @@ export class DOMTools {
       const input = inputs[i];
       const bbox = await input.boundingBox();
       if (bbox) {
+        const arialabel = await input.getAttribute('aria-label') || '';
         const placeholder = await input.getAttribute('placeholder') || '';
         const name = await input.getAttribute('name') || '';
-        const label = placeholder || name || `Input ${i + 1}`;
+        const id= await input.getAttribute('id') || '';
+        const label=arialabel.trim() || placeholder.trim() || name.trim() || id.trim() || `Input ${i + 1}`;
         
         regions.push({
           id: `input-${i}`,
@@ -124,39 +126,50 @@ export class DOMTools {
   /**
    * Click by region ID (DOM fallback)
    */
-  async clickByRegionId(regionId: string): Promise<void> {
-    const [type, index] = regionId.split('-');
-    
-    if (type === 'link') {
-      const links = await this.page.locator('a[href]').all();
-      const idx = parseInt(index, 10);
-      if (links[idx]) {
-        await links[idx].click();
-      } else {
-        throw new Error(`Link region ${regionId} not found`);
+    async clickByRegionId(regionId: string): Promise<void> {
+      if (regionId.startsWith('link-')) {
+        const idx = parseInt(regionId.split('-')[1]!, 10);
+        const links = await this.page.locator('a[href]').all();
+        if (links[idx]) {
+          await links[idx].click();
+        } else {
+          throw new Error(`Link region ${regionId} not found`);
+        }
+        return;
       }
-    } else if (type === 'button') {
-      const buttons = await this.page.locator('button').all();
-      const idx = parseInt(index, 10);
-      if (buttons[idx]) {
-        await buttons[idx].click();
-      } else {
-        throw new Error(`Button region ${regionId} not found`);
+
+      if (regionId.startsWith('button-')) {
+        const idx = parseInt(regionId.split('-')[1]!, 10);
+        const buttons = await this.page.locator('button').all();
+        if (buttons[idx]) {
+          await buttons[idx].click();
+        } else {
+          throw new Error(`Button region ${regionId} not found`);
+        }
+        return;
       }
-    } else if (type === 'role') {
-      const parts = regionId.split('-');
-      const role = parts[1];
-      const idx = parseInt(parts[2], 10);
-      const clickables = await this.page.locator(`[role="${role}"]`).all();
-      if (clickables[idx]) {
-        await clickables[idx].click();
-      } else {
-        throw new Error(`Role region ${regionId} not found`);
+
+      if (regionId.startsWith('role-')) {
+        // format: role-{role}-{index}
+        const parts = regionId.split('-');
+        const role = parts[1];
+        const idx = parseInt(parts[2]!, 10);
+        if (!role || Number.isNaN(idx)) {
+          throw new Error(`Invalid role regionId format: ${regionId}`);
+        }
+
+        const clickables = await this.page.locator(`[role="${role}"]`).all();
+        if (clickables[idx]) {
+          await clickables[idx].click();
+        } else {
+          throw new Error(`Role region ${regionId} not found`);
+        }
+        return;
       }
-    } else {
-      throw new Error(`Unknown region type: ${type}`);
+
+      throw new Error(`Unknown regionId format: ${regionId}`);
     }
-  }
+
 
   /**
    * Click by role and name (Playwright best practice)
@@ -189,6 +202,10 @@ export class DOMTools {
     } else {
       throw new Error(`Cannot fill region type: ${type}`);
     }
+  }
+
+  async pressKey(key: string): Promise<void> {
+    await this.page.keyboard.press(key);
   }
 
   /**

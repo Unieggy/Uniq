@@ -18,6 +18,24 @@ export class Guardrails {
    */
   async checkAction(action: Action, regions: Region[]): Promise<GuardrailResult> {
     // Check domain allowlist
+    if(action.type==='DOM_FILL'||action.type==='VISION_FILL'){
+      let label='';
+      if(action.type==='VISION_FILL'){
+        const region=regions.find(r=>r.id===action.regionId);
+        label=region?.label||'';
+      }else{
+        label=`${action.name || ''} ${action.selector || ''}`;
+      }
+      const labelLower=label.toLowerCase();
+      const sensitiveKeywords=['email','username','user name','billing','mfa','otp','password','passcode','credit card','ccv','ssn','social security','address','phone number','dob','date of birth','api key','secret','cvc','debit','bank account'];
+      if (sensitiveKeywords.some(keyword=>labelLower.includes(keyword))){
+        return{
+          allowed:false,
+          reason:`Filling sensitive field "${label}" is not allowed by guardrails`,
+          requiresConfirmation:false,
+        };
+        }
+    }
     if (action.type === 'VISION_CLICK' || action.type === 'DOM_CLICK') {
       const region = regions.find(r => r.id === (action as any).regionId);
       if (region) {

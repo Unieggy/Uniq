@@ -11,6 +11,7 @@ import { DOMTools } from '../browser/domTools.js';
 import { Regionizer } from '../vision/regionizer.js';
 import {config} from '../config.js';
 import { text } from 'stream/consumers';
+import { tr } from 'zod/v4/locales';
 export class AgentController {
   private stepCount = 0;
   private maxSteps = 50; // Safety limit
@@ -31,7 +32,7 @@ export class AgentController {
     onStep: (phase: 'OBSERVE' | 'DECIDE' | 'ACT' | 'VERIFY', message: string, action?: Action) => Promise<void>,
     opts?:{resetStepCount?:boolean}
   ): Promise<{ completed: boolean; reason: string;pendingAction?: Action ;pauseKind?:'ASK_USER'|'CONFIRM' }> {
-    const reset = opts?.resetStepCount ?? false;
+    const reset = opts?.resetStepCount ?? true;
     if (reset) {
       this.stepCount = 0;
     }
@@ -241,8 +242,11 @@ Allowed action types:
 - ASK_USER: { "type":"ASK_USER", "message": string, "actionId"?: string }
 - CONFIRM: { "type":"CONFIRM", "message": string, "actionId"?: string }
 - DONE: { "type":"DONE", "reason"?: string }
+- VISION_FILL: { "type":"VISION_FILL", "regionId": string, "value": string, "description"?: string }
+- KEY_PRESS: { "type":"KEY_PRESS", "key": string, "description"?: string }
 
 IMPORTANT:
+- The initial page starts as unsigned-in. So if the task involves personal data, accounts, or payments..etc you must first sign in.
 - If this page requires credentials, login, payment, or MFA, return ASK_USER with a clear message telling the human what to do, and do NOT attempt to fill passwords.
 - If you are unsure, return ASK_USER instead of guessing.
 `.trim();
@@ -331,6 +335,14 @@ IMPORTANT:
         } else {
           throw new Error('DOM_FILL requires either role+name or selector');
         }
+        break;
+
+      case 'KEY_PRESS':
+        await this.domTools.pressKey(action.key);
+        break;
+  
+      case 'VISION_FILL':
+        await this.domTools.fillByRegionId(action.regionId, action.value);
         break;
 
       case 'WAIT':
