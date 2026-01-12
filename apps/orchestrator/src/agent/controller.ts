@@ -9,6 +9,8 @@ import { Guardrails } from '../policy/guardrails.js';
 import { Verifier } from '../verify/verifier.js';
 import { DOMTools } from '../browser/domTools.js';
 import { Regionizer } from '../vision/regionizer.js';
+import {config} from '../config.js';
+import { text } from 'stream/consumers';
 export class AgentController {
   private stepCount = 0;
   private maxSteps = 50; // Safety limit
@@ -26,9 +28,13 @@ export class AgentController {
    */
   async runLoop(
     task: string,
-    onStep: (phase: 'OBSERVE' | 'DECIDE' | 'ACT' | 'VERIFY', message: string, action?: Action) => Promise<void>
+    onStep: (phase: 'OBSERVE' | 'DECIDE' | 'ACT' | 'VERIFY', message: string, action?: Action) => Promise<void>,
+    opts?:{resetStepCount?:boolean}
   ): Promise<{ completed: boolean; reason: string;pendingAction?: Action ;pauseKind?:'ASK_USER'|'CONFIRM' }> {
-    this.stepCount = 0;
+    const reset = opts?.resetStepCount ?? false;
+    if (reset) {
+      this.stepCount = 0;
+    }
 
     while (this.stepCount < this.maxSteps) {
       this.stepCount++;
@@ -115,13 +121,14 @@ export class AgentController {
 
   /**
    * Decide next action based on task and current state
-   * 
-   * V1: Simple rule-based controller
-   * Future: Replace with LLM tool-calling
    */
   private async decide(task: string, regions: Region[], step: number): Promise<Decision> {
-    // Simple rule-based controller for v1
-    // If task mentions "click first link", do that
+    const llmDecision=await this.tryGeminiDecision(task, regions, step);
+    if(llmDecision){
+      console.log('Gemini decision:', llmDecision.action.type, llmDecision.action);
+      return llmDecision;
+    }
+    console.log('[agent] Gemini decision: null (falling back to heuristics)');
     if (task.toLowerCase().includes('click') && task.toLowerCase().includes('first link')) {
       const links = regions.filter(r => r.id.startsWith('link-'));
       if (links.length > 0) {
@@ -182,6 +189,117 @@ export class AgentController {
       reasoning: 'Could not determine appropriate action',
       confidence: 0.3,
     };
+  }
+  private extractFirstJsonObject(text: string): string | null{
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start !== -1 && end !== -1 && end > start) {
+      return text.slice(start, end + 1);
+    }
+    return null;
+  }
+  private async tryGeminiDecision(task: string, regions: Region[], step: number): Promise<Decision | null> {
+    const apiKey=config.llm?.geminiApiKey;
+    if (!apiKey){ 
+      console.error('Gemini API key not configured');
+      return null;}
+    const regionchoices=regions.slice(0,40).map(r=>({id:r.id, label:r.label}));
+    const url=this.domTools.getUrl();
+    const pageText=await this.domTools.getPageText();
+    const pageTextSnippet=pageText.slice(0,1500); // Limit to first 1500 chars
+    const prompt=`
+You are controlling a local browser agent.
+
+TASK:
+${task}
+
+STEP:
+${step}
+
+CURRENT URL:
+${url}
+
+PAGE TEXT (truncated):
+${pageTextSnippet}
+
+INTERACTIVE REGIONS (choose by id):
+${JSON.stringify(regionchoices, null, 2)}
+
+You MUST respond with ONLY valid JSON (no backticks, no extra text) matching this TypeScript shape:
+
+{
+  "action": { "type": "...", ... },
+  "reasoning": string,
+  "confidence": number
+}
+
+Allowed action types:
+- VISION_CLICK: { "type":"VISION_CLICK", "regionId": string, "description"?: string }
+- DOM_CLICK: { "type":"DOM_CLICK", "selector"?: string, "role"?: "button"|"link"|"textbox"|"checkbox"|"radio", "name"?: string, "description"?: string }
+- DOM_FILL: { "type":"DOM_FILL", "selector"?: string, "role"?: "textbox", "name"?: string, "value": string, "description"?: string }
+- WAIT: { "type":"WAIT", "duration"?: number, "until"?: string, "description"?: string }
+- ASK_USER: { "type":"ASK_USER", "message": string, "actionId"?: string }
+- CONFIRM: { "type":"CONFIRM", "message": string, "actionId"?: string }
+- DONE: { "type":"DONE", "reason"?: string }
+
+IMPORTANT:
+- If this page requires credentials, login, payment, or MFA, return ASK_USER with a clear message telling the human what to do, and do NOT attempt to fill passwords.
+- If you are unsure, return ASK_USER instead of guessing.
+`.trim();
+    try {
+      const model='gemini-2.5-flash'; // Example model name
+      const endpoint=`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const res=await fetch(endpoint,{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          contents:[
+            {role:"user",parts:[{text:prompt}]},
+          ],
+          generationConfig:{
+            temperature:0.2,
+          },
+        }),
+      });
+      if(!res.ok){
+        const text=await res.text();
+        console.warn(`Gemini request failed (${res.status}): ${text}`);
+        if (step===1) {
+          return{
+            action:{type:'ASK_USER', message: `Gemini request failed (HTTP ${res.status}). Check orchestrator console for the response body.`,actionId:'gemini_fail-1'},
+            reasoning:'Gemini API request failed',
+            confidence:0.0,
+
+          };
+
+      }
+        return null;
+    }
+      const json=(await res.json()) as any;
+      const text:string|undefined=
+        json?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if(!text){
+        console.warn('Gemini response missing text');
+        return null;
+      }
+      const cleaned=this.extractFirstJsonObject(text);
+      if(!cleaned){
+        console.warn('Gemini response JSON extraction failed');
+        return null;
+      }
+      const parsed=JSON.parse(cleaned);
+      const validated=DecisionSchema.safeParse(parsed);
+      if(!validated.success){
+        console.warn(`Gemini DecisionSchema validation failed: ${validated.error.message}`);
+        return null;
+      }
+      return validated.data;
+
+    }catch(err){
+      console.warn('Gemini decision error:', err);
+      return null;
+    }
+
   }
   public async executeAction(action: Action): Promise<void> {
     await this.act(action);

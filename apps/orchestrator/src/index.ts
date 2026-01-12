@@ -30,6 +30,7 @@ class Orchestrator {
     task: string;
     stepCount: number;
     paused: boolean;
+    resume?: boolean;
     pendingAction?: import('./agent/schemas.js').Action;
     wsClient?: WebSocket;
   }> = new Map();
@@ -125,7 +126,7 @@ class Orchestrator {
             if(action){
               await session.agent.executeAction(action);
             }
-
+            session.resume=true;
             // Resume agent loop from current page state
             this.runAgentLoop(sessionId).catch((error) => {
               console.error(`Agent loop error for session ${sessionId}:`, error);
@@ -154,6 +155,7 @@ class Orchestrator {
 
   async handleTask(request: TaskRequest, wsClient: WebSocket): Promise<void> {
     const sessionId = request.sessionId || randomUUID();
+    
     const task = request.task;
 
     console.log(`Starting task for session ${sessionId}: ${task}`);
@@ -306,8 +308,10 @@ class Orchestrator {
           });
         }
         // completed or failed (no pending action)
-      }
+      },
+      {resetStepCount:!session.resume}
     );
+    session.resume=false;
 
     // completed=>end session
     if(result.completed){
@@ -328,6 +332,7 @@ class Orchestrator {
     const isPaused=Boolean(result.pauseKind)||Boolean(result.pendingAction);
     if (isPaused){
       session.paused = true;
+      session.resume= true;
       session.pendingAction = result.pendingAction;
       this.db.updateSessionStatus(sessionId, 'paused');
       this.sendMessage(wsClient, {

@@ -3,7 +3,7 @@
   "compilerOptions": {
     "outDir": "./dist",
     "rootDir": "./src",
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "types": ["node"],
     "lib": ["ES2022"],
     "skipLibCheck": true

@@ -65,14 +65,14 @@ export function loadConfig(): Config {
   return {
     port: parseInt(getEnv('PORT', '3001'), 10),
     wsPort: parseInt(getEnv('WS_PORT', '3002'), 10),
-    startUrl: getEnv('START_URL', 'https://example.com'),
+    startUrl: getEnv('START_URL', 'https://www.google.com'),
     browser: {
       headless: getEnv('BROWSER_HEADLESS', 'false') === 'true',
       width: parseInt(getEnv('BROWSER_WIDTH', '1280'), 10),
       height: parseInt(getEnv('BROWSER_HEIGHT', '720'), 10),
     },
     llm: {
-      geminiApiKey: getEnv('GEMINI_API_KEY', ''),
+      geminiApiKey: getEnv('GEMINI_API_KEY', 'AIzaSyDbLt0FJ6ot6PUYAHIEc_6yBcnSrl0njEA'),
     },
     vision: {
       model: getEnv('VISION_MODEL', ''),

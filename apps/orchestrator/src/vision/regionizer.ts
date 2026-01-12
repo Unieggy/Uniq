@@ -20,7 +20,7 @@ export class Regionizer {
    */
   async detectRegions(): Promise<Region[]> {
     // Check if we have vision model configured
-    if (config.vision?.model && (config.llm?.openaiApiKey || config.llm?.anthropicApiKey)) {
+    if (config.vision?.model && (config.llm?.geminiApiKey )) {
       // TODO: Implement real vision model integration
       // For now, fall through to DOM fallback
     }
