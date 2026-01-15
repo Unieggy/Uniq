@@ -13,20 +13,25 @@ export const ActionSchema = z.discriminatedUnion('type', [
   }),
   z.object({
     type: z.literal('DOM_CLICK'),
+    // NEW: Allow regionId as a fallback method to click specific elements instantly
+    regionId: zOptString, 
     selector: zOptString,
     name: zOptString,
     description: zOptString,
     role: z.enum(['button', 'link', 'textbox', 'checkbox', 'radio']).optional(),
-
   }),
- z.object({
-  type: z.literal('DOM_FILL'),
-  selector: zOptString,
-  name: zOptString,
-  description: zOptString,
-  value: z.string(),
-  role: z.enum(['textbox']).optional(),
-}),
+
+  // UPDATE THIS BLOCK:
+  z.object({
+    type: z.literal('DOM_FILL'),
+    // NEW: Allow regionId here too
+    regionId: zOptString,
+    selector: zOptString,
+    name: zOptString,
+    description: zOptString,
+    value: z.string(),
+    role: z.enum(['textbox']).optional(),
+  }),
   z.object({
     type: z.literal('WAIT'),
     duration: z.number().optional(),
@@ -57,6 +62,7 @@ export const ActionSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('KEY_PRESS'),
     key: z.string(), // e.g. "Enter"
+    regionId: z.string().optional(),
     description: z.string().optional(),
   }),
 
@@ -69,7 +75,7 @@ export const DecisionSchema=z.object({
   confidence: z.number().min(0).max(1),
 });
 export const PlanSchema=z.object({
-  plan:z.array(z.string().min(1).min(1).max(10)),
+  plan:z.array(z.string().min(1).min(1).max(200)),
 });
 export type PlanResult=z.infer<typeof PlanSchema>;
 

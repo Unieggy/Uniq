@@ -19,18 +19,9 @@ export class Regionizer {
    * For now, uses DOM-based heuristics as fallback.
    */
   async detectRegions(): Promise<Region[]> {
-    // Check if we have vision model configured
-    if (config.vision?.model && (config.llm?.geminiApiKey )) {
-      // TODO: Implement real vision model integration
-      // For now, fall through to DOM fallback
-    }
-
-    // DOM fallback: find clickable elements and inputs
-    const clickableRegions = await this.domTools.findClickableRegions();
-    const inputRegions = await this.domTools.findInputFields();
-    
-    return [...clickableRegions, ...inputRegions];
-  }
+  // Directly use our new robust scanner
+  return await this.domTools.scanPage(); 
+}
 
   /**
    * Get observation summary from regions

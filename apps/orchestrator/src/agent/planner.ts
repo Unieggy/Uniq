@@ -40,47 +40,37 @@ function enforceTags(task: string, plan: string[]): string[] {
 
 export async function planTaskWithGemini(task: string): Promise<string[]> {
   const apiKey = config.llm?.geminiApiKey;
-  if (!apiKey) return heuristicPlan(task);
+  if (!apiKey || apiKey.startsWith('AIzaSyDbLt')){ 
+    console.warn('Gemini API key not set or is a placeholder. Using heuristic planner.');
+    return heuristicPlan(task)};
 
   const prompt = `
-You are a PLANNER for a local-first browser agent.
+You are a PLANNER for a browser automation agent.
+Your job is to break a high-level user task into a linear list of sequential steps.
 
-Your job: break the user task into a short list of browser objectives.
-You do NOT execute actions. You only output a plan.
+USER TASK: "${task}"
 
-User task:
-${task}
+RULES:
+1. RESPONSE FORMAT: You must return ONLY a JSON object: { "plan": string[] }
+2. STEPS: Max 6 steps. Keep them short and concise.
+3. TAGS:
+   - Use "[HUMAN]" for steps requiring user interaction (Login, OTP, MFA, CAPTCHA, Payment).
+   - Use "[AGENT]" for steps the browser can do (Search, Click, Read, Navigate).
+4. LOGIN: If the task implies a specific service (like "Order Amazon"), assume the user is NOT logged in.
+   - Step 1 MUST be: "[HUMAN] Sign in and complete any MFA prompts"
+   - Do NOT ask for credentials in the plan.
 
-OUTPUT FORMAT (STRICT):
-Return ONLY valid JSON:
-{ "plan": string[] }
+EXAMPLE JSON:
+{
+  "plan": [
+    "[HUMAN] Sign in and complete any MFA prompts",
+    "[AGENT] Search for 'ps5 console'",
+    "[AGENT] Click the first result",
+    "[AGENT] Click 'Add to Cart'"
+  ]
+}
 
-HARD RULES:
-- Every step MUST start with "[HUMAN]" or "[AGENT]" (exact casing).
-- Max 6 steps. Min 1 step.
-- Steps must be short objectives, not long explanations.
-- NEVER ask for credentials. NEVER include passwords/OTP/payment details.
-- If task includes sign-in/login/MFA/OTP/2FA, step 1 MUST be exactly:
-  "[HUMAN] Sign in and complete any MFA prompts"
-
-AGENT STEP STYLE:
-- Must be executable on a normal webpage using: click / fill / press Enter / wait.
-- Use concrete goals like:
-  "[AGENT] Search Google for: cat images"
-  "[AGENT] Open Google Images results"
-  "[AGENT] Click Images tab"
-  "[AGENT] Open first image result"
-
-GOOD EXAMPLES:
-{ "plan": ["[HUMAN] Sign in and complete any MFA prompts", "[AGENT] Search Google for: cat images", "[AGENT] Open Google Images results"] }
-
-BAD EXAMPLES (do NOT do these):
-- "Sign me in"
-- "Provide your email"
-- "Log into the account using credentials"
-- "Search for cats" (missing platform and missing tag)
-
-Now output the JSON plan.
+Respond with the JSON now.
 `.trim();
 
 
@@ -99,25 +89,36 @@ Now output the JSON plan.
       }),
     });
 
-    if (!res.ok) {
+    const json = (await res.json()) as any;
+    const rawText: string | undefined = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!rawText) return heuristicPlan(task);
+
+    // FIX: Use Regex to extract JSON from Markdown code blocks
+    const jsonRegex = /```json\s*([\s\S]*?)\s*```/;
+    const match = rawText.match(jsonRegex);
+    
+    // Use extracted content if found, otherwise use raw text
+    const cleanText = match ? match[1] : rawText;
+
+    // Find the start and end of the JSON object
+    const start = cleanText.indexOf('{');
+    const end = cleanText.lastIndexOf('}');
+    
+    if (start === -1 || end === -1 || end <= start) return heuristicPlan(task);
+
+    const parsed = JSON.parse(cleanText.slice(start, end + 1));
+    const validated = PlanSchema.safeParse(parsed);
+    
+    if (!validated.success) {
+      console.warn('[Planner] Invalid JSON schema:', validated.error);
       return heuristicPlan(task);
     }
 
-    const json = (await res.json()) as any;
-    const text: string | undefined = json?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) return heuristicPlan(task);
-
-    // Extract first JSON object
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start === -1 || end === -1 || end <= start) return heuristicPlan(task);
-
-    const parsed = JSON.parse(text.slice(start, end + 1));
-    const validated = PlanSchema.safeParse(parsed);
-    if (!validated.success) return heuristicPlan(task);
-    const plan = enforceTags(task, validated.data.plan);
-    return plan;
-  } catch {
+    // Apply the "[AGENT]" tags if Gemini forgot them
+    return enforceTags(task, validated.data.plan);
+  } catch(error) {
+    console.error('❌ PLANNER ERROR:', error);
     return heuristicPlan(task);
   }
 }

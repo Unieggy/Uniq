@@ -16,6 +16,17 @@ import { url } from 'inspector';
 export class AgentController {
   private stepCount = 0;
   private maxSteps = 50; // Safety limit
+  private lastAction: Action | undefined;
+  private postFillSubmitTries = 0;
+  private lastOutcome: {
+    stateChanged: boolean;
+    urlBefore: string;
+    urlAfter: string;
+    titleBefore: string;
+    titleAfter: string;
+    textBefore: string;
+    textAfter: string;
+  } | undefined;
 
   constructor(
     private domTools: DOMTools,
@@ -36,22 +47,9 @@ export class AgentController {
     const reset = opts?.resetStepCount ?? true;
     if (reset) {
       this.stepCount = 0;
+      this.lastAction = undefined;
+      this.lastOutcome = undefined;
     }
-        // Step-local feedback (NOT persisted memory).
-    // This helps the model adapt strategy when an action doesn't change the page.
-    let lastAction: Action | undefined;
-    let lastOutcome:
-      | {
-          stateChanged: boolean;
-          urlBefore: string;
-          urlAfter: string;
-          titleBefore: string;
-          titleAfter: string;
-          textBefore: string;
-          textAfter: string;
-        }
-      | undefined;
-    let postFillSubmitTries = 0;
 
       
     while (this.stepCount < this.maxSteps) {
@@ -64,21 +62,23 @@ export class AgentController {
       await onStep('OBSERVE', observation);
       // ====== AUTO-RECOVERY: submit after fill if no state change ======
       const lastWasFill =
-        lastAction?.type === 'VISION_FILL' || lastAction?.type === 'DOM_FILL';
+        this.lastAction?.type === 'VISION_FILL' || this.lastAction?.type === 'DOM_FILL';
 
-      if (lastWasFill && lastOutcome && lastOutcome.stateChanged === false) {
+      if (lastWasFill && this.lastOutcome && this.lastOutcome.stateChanged === false) {
         let injectedAction: Action;
 
         // 1st try: press Enter
-        if (postFillSubmitTries === 0) {
+        if (this.postFillSubmitTries === 0) {
+          const targetRegionId=(this.lastAction as any).regionId;
           injectedAction = {
             type: 'KEY_PRESS',
             key: 'Enter',
+            regionId:targetRegionId,
             description: 'Auto-submit after fill (Enter)',
           };
         }
         // 2nd try: click a likely Search/Submit button, else Enter again
-        else if (postFillSubmitTries === 1) {
+        else if (this.postFillSubmitTries === 1) {
           const keywords = ['search', 'submit', 'go', 'find'];
 
           const candidate = regions.find(r => {
@@ -118,7 +118,7 @@ export class AgentController {
 
         await onStep(
           'DECIDE',
-          `No state change after fill. Auto-recovery attempt ${postFillSubmitTries + 1}: ${injectedAction.type}`,
+          `No state change after fill. Auto-recovery attempt ${this.postFillSubmitTries + 1}: ${injectedAction.type}`,
           injectedAction
         );
 
@@ -135,10 +135,10 @@ export class AgentController {
             `Auto-recovery failed: ${error instanceof Error ? error.message : String(error)}`
           );
 
-          postFillSubmitTries++;
+          this.postFillSubmitTries++;
 
-          lastAction = injectedAction;
-          lastOutcome = {
+          this.lastAction = injectedAction;
+          this.lastOutcome = {
             stateChanged: false,
             urlBefore,
             urlAfter: urlBefore,
@@ -161,8 +161,8 @@ export class AgentController {
           titleBefore !== titleAfter ||
           textBefore !== textAfter;
 
-        lastAction = injectedAction;
-        lastOutcome = {
+        this.lastAction = injectedAction;
+        this.lastOutcome = {
           stateChanged,
           urlBefore,
           urlAfter,
@@ -172,8 +172,8 @@ export class AgentController {
           textAfter,
         };
 
-        if (stateChanged) postFillSubmitTries = 0;
-        else postFillSubmitTries++;
+        if (stateChanged) this.postFillSubmitTries = 0;
+        else this.postFillSubmitTries++;
 
         // Skip normal DECIDE this loop iteration
         continue;
@@ -184,8 +184,8 @@ export class AgentController {
       // DECIDE
       await onStep('DECIDE', `Step ${this.stepCount}: Deciding next action`);
       const decision = await this.decide(task, regions, this.stepCount, {
-        lastAction,
-        lastOutcome,
+        lastAction: this.lastAction,
+        lastOutcome: this.lastOutcome,
       });
 
       const parsed= DecisionSchema.safeParse(decision);
@@ -239,8 +239,8 @@ export class AgentController {
       } catch (error) {
         await onStep('ACT', `Action failed: ${error instanceof Error ? error.message : String(error)}`);
         // Continue to next step
-        lastAction = validatedDecision.action;
-        lastOutcome = {
+        this.lastAction = validatedDecision.action;
+        this.lastOutcome = {
           stateChanged: false,
           urlBefore,
           urlAfter:urlBefore,
@@ -269,8 +269,8 @@ export class AgentController {
         textBefore !== textAfter;
 
       // Store feedback for next DECIDE
-      lastAction = validatedDecision.action;
-      lastOutcome = {
+      this.lastAction = validatedDecision.action;
+      this.lastOutcome = {
         stateChanged,
         urlBefore,
         urlAfter,
@@ -443,19 +443,23 @@ You MUST respond with ONLY valid JSON (no backticks, no extra text) matching thi
 {
   "action": { "type": "...", ... },
   "reasoning": string,
-  "confidence": number
+  "confidence": 0-1.0
 }
 
 Allowed action types:
-- VISION_CLICK: { "type":"VISION_CLICK", "regionId": string, "description"?: string }
-- DOM_CLICK: { "type":"DOM_CLICK", "selector"?: string, "role"?: "button"|"link"|"textbox"|"checkbox"|"radio", "name"?: string, "description"?: string }
-- DOM_FILL: { "type":"DOM_FILL", "selector"?: string, "role"?: "textbox", "name"?: string, "value": string, "description"?: string }
-- WAIT: { "type":"WAIT", "duration"?: number, "until"?: string, "description"?: string }
-- ASK_USER: { "type":"ASK_USER", "message": string, "actionId"?: string }
-- CONFIRM: { "type":"CONFIRM", "message": string, "actionId"?: string }
-- DONE: { "type":"DONE", "reason"?: string }
-- VISION_FILL: { "type":"VISION_FILL", "regionId": string, "value": string, "description"?: string }
-- KEY_PRESS: { "type":"KEY_PRESS", "key": string, "description"?: string }
+1. **VISION_CLICK** / **DOM_CLICK**:
+   - MUST include "regionId".
+   - Example: { "type": "VISION_CLICK", "regionId": "element-123" }
+
+2. **VISION_FILL** / **DOM_FILL**:
+   - MUST include "regionId" AND "value".
+   - Example: { "type": "VISION_FILL", "regionId": "element-123", "value": "search term" }
+3. WAIT: { "type":"WAIT", "duration"?: number, "until"?: string, "description"?: string }
+4. ASK_USER: { "type":"ASK_USER", "message": string, "actionId"?: string }
+5. CONFIRM: { "type":"CONFIRM", "message": string, "actionId"?: string }
+6. DONE: { "type":"DONE", "reason"?: string }
+
+- KEY_PRESS: { "type":"KEY_PRESS", "key": string, "regionId"?: string, "description"?: string }
 
 IMPORTANT:
 - The initial page starts as unsigned-in. So if the task involves personal data, accounts, or payments..etc you must first sign in.
@@ -464,7 +468,7 @@ IMPORTANT:
 - Never repeat the exact same action if lastOutcome.stateChanged is false.
 - For example, If you filled an input and stateChanged is false, try a different strategy (e.g. KEY_PRESS "Enter" or click a search/submit button) instead of filling again.
 - Never use null. If a field is not needed, omit it entirely.
-
+- If no button exists, use KEY_PRESS "Enter" with the 'regionId' of the input field you just filled.
 `.trim();
     try {
       const model='gemini-2.5-flash'; // Example model name
@@ -527,40 +531,57 @@ IMPORTANT:
   /**
    * Execute an action
    */
+  /**
+   * Execute an action
+   */
   private async act(action: Action): Promise<void> {
     switch (action.type) {
+      // --- 1. HUMAN-LIKE ACTIONS (Physics) ---
+      // The agent chose "VISION", so we use the cursor physics we just added.
       case 'VISION_CLICK':
-        await this.domTools.clickByRegionId(action.regionId);
+        await this.domTools.cursorClick(action.regionId);
         break;
 
+      case 'VISION_FILL':
+        await this.domTools.cursorFill(action.regionId, action.value);
+        break;
+
+      // --- 2. INSTANT ACTIONS (Fallback) ---
+      // The agent chose "DOM", so we use instant execution.
+      // This now supports RegionID (if vision failed) OR Selectors (if regions aren't working)
       case 'DOM_CLICK':
-        if (action.role && action.name) {
+        if (action.regionId) {
+          await this.domTools.clickByRegionId(action.regionId);
+        } else if (action.role && action.name) {
           await this.domTools.clickByRole(action.role, action.name);
         } else if (action.selector) {
           await this.domTools.clickSelector(action.selector);
         } else {
-          throw new Error('DOM_CLICK requires either role+name or selector');
+          throw new Error('DOM_CLICK requires regionId, role+name, or selector');
         }
         break;
 
       case 'DOM_FILL':
-        if (action.role && action.name) {
+        if (action.regionId) {
+          await this.domTools.fillByRegionId(action.regionId, action.value);
+        } else if (action.role && action.name) {
           await this.domTools.fillByRole(action.role, action.name, action.value);
         } else if (action.selector) {
           await this.domTools.fillSelector(action.selector, action.value);
         } else {
-          throw new Error('DOM_FILL requires either role+name or selector');
+          throw new Error('DOM_FILL requires regionId, role+name, or selector');
         }
         break;
 
+      // --- 3. UTILITIES (Unchanged) ---
       case 'KEY_PRESS':
-        await this.domTools.pressKey(action.key);
+        if(action.regionId){
+          await this.domTools.pressKeyOnRegion(action.regionId, action.key);
+        }else{
+          await this.domTools.pressKey(action.key);
+        }
         break;
   
-      case 'VISION_FILL':
-        await this.domTools.fillByRegionId(action.regionId, action.value);
-        break;
-
       case 'WAIT':
         if (action.duration) {
           await new Promise(resolve => setTimeout(resolve, action.duration));
