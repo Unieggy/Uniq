@@ -22,5 +22,9 @@ export class ScreenshotManager {
     });
     return screenshot as Buffer;
   }
+
+  public setPage(page: import('playwright').Page): void {
+    this.page = page;
+  }
 }
 

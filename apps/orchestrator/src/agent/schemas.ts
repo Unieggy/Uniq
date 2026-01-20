@@ -74,9 +74,21 @@ export const DecisionSchema=z.object({
   reasoning: z.string(),
   confidence: z.number().min(0).max(1),
 });
-export const PlanSchema=z.object({
-  plan:z.array(z.string().min(1).min(1).max(200)),
+// In src/agent/schemas.ts
+
+export const PlanSchema = z.object({
+  // 1. The Strategy: The AI's high-level analysis (Mental Simulation)
+  strategy: z.string().describe("High-level reasoning and mental simulation of the workflow (e.g. 'This site requires SSO login...')."),
+  
+  // 2. The Steps: Rich objects instead of just strings
+  steps: z.array(z.object({
+    id: z.number(),
+    title: z.string().describe("Short objective (e.g. 'Search for chatgpt')"),
+    description: z.string().describe("Detailed guidance on what to look for (e.g. 'Find the search bar at the top center')."),
+    needsAuth: z.boolean().describe("True if this step involves login/MFA."),
+  })).max(15)
 });
+
 export type PlanResult=z.infer<typeof PlanSchema>;
 
 

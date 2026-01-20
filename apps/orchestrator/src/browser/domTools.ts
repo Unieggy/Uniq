@@ -32,29 +32,39 @@ export class DOMTools {
 
     // 3. Loop through and "Tag" them
     for (const element of elements) {
-      if (!await element.isVisible()) continue; // Skip invisible stuff
+      if (!await element.isVisible()) continue;
 
-      const bbox = await element.boundingBox();
-      if (!bbox || bbox.width < 5 || bbox.height < 5) continue; // Skip tiny/broken stuff
+      let bbox = await element.boundingBox();
+      if (!bbox || bbox.width < 5 || bbox.height < 5) continue;
 
-      // Generate a UNIQUE ID (This is the fix!)
-      // Example: "element-a1b2-c3d4"
+      // 3. Get Standard Label
+      const tagName = await element.evaluate(el => el.tagName.toLowerCase());
+      let text = (await element.textContent()) || '';
+      let label = (await element.getAttribute('aria-label')) || 
+                  (await element.getAttribute('name')) || 
+                  (await element.getAttribute('placeholder')) || 
+                  text;
+      
+      // 4. IMAGE DETECTION (The Fix)
+      if (!label || label.trim().length === 0) {
+        const img = element.locator('img').first();
+        if (await img.count() > 0) {
+          const alt = await img.getAttribute('alt');
+          label = alt ? `Image: ${alt}` : "Unlabeled Image";
+        }
+      }
+
+      // 5. Cleanup
+      label = label.replace(/\s+/g, ' ').trim().slice(0, 100);
+      
+      if (label.length === 0) continue;
+
       const id = `element-${randomUUID().slice(0, 8)}`;
-
-      // Save the ACTUAL browser element to our memory map
       this.elementStore.set(id, element);
 
-      // Get a label for the AI
-      const tagName = await element.evaluate(el => el.tagName.toLowerCase());
-      const text = (await element.textContent()) || '';
-      const label = (await element.getAttribute('aria-label')) || 
-                    (await element.getAttribute('name')) || 
-                    (await element.getAttribute('placeholder')) || 
-                    text;
-
       regions.push({
-        id: id, // We send this ID to the AI
-        label: (label || tagName).trim().slice(0, 50),
+        id: id,
+        label: label,
         bbox: { x: bbox.x, y: bbox.y, w: bbox.width, h: bbox.height },
         confidence: 1.0
       });
@@ -219,6 +229,10 @@ export class DOMTools {
 
     // 3. Type character by character with slight delay
     await this.page.keyboard.type(value, { delay: 50 }); 
+  }
+
+  public setPage(page: import('playwright').Page): void {
+    this.page = page;
   }
 
 

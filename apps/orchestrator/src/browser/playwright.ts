@@ -57,5 +57,11 @@ export class BrowserController {
     }
     return this.page.title();
   }
+  public getAllPages(): import('playwright').Page[] {
+    return this.context?.pages() || [];
+  }
+  public setPage(page: import('playwright').Page): void {
+    this.page = page;
+  }
 }
 

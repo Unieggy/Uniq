@@ -457,6 +457,16 @@ You MUST respond with ONLY valid JSON (no backticks, no extra text) matching thi
   "reasoning": string,
   "confidence": 0-1.0
 }
+INTELLIGENT RULES (READ CAREFULLY):
+1. **CHECK IF DONE FIRST**: Before choosing an action, check if the "Current Step" is ALREADY accomplished.
+   - **Google Images**: If the URL contains "udm=2" or "tbm=isch", you are ALREADY on the Images tab. DO NOT click "Images" again. Return "DONE".
+   - **Tabs**: If the button for the target tab is disabled or highlighted, you are likely already there.
+   
+2. **SELF-CORRECTION**: 
+   - Look at your HISTORY. Did you just try to "Click Images" and the URL is now different? If yes, assume it worked and move on.
+   - If an action failed (Timeout/Not Enabled), it means the element is not interactive (likely because it's the active tab). Stop clicking it.
+
+3. **USE THE ID**: Always pick the element ID (e.g., "element-123") from the list below.
 
 Allowed action types:
 1. **VISION_CLICK** / **DOM_CLICK**:

@@ -17,6 +17,7 @@ import type { WebSocketMessage, TaskRequest, UserConfirmation } from './shared/t
 import { WebSocket } from 'ws';
 import { randomUUID } from 'crypto';
 import { planTaskWithGemini } from './agent/planner.js';
+import { PlanResult } from './agent/schemas.js';
 import { tr } from 'zod/v4/locales';
 class Orchestrator {
   private server: Server;
@@ -34,10 +35,11 @@ class Orchestrator {
     resume?: boolean;
     pendingAction?: import('./agent/schemas.js').Action;
     wsClient?: WebSocket;
-    plan: string[];
+    plan: PlanResult['steps'];
     planIndex: number;
     completedSteps: string[];
     pausedForHumanObjective?: string;
+    strategy:string
 
 
   }> = new Map();
@@ -186,7 +188,7 @@ class Orchestrator {
     const guardrails = new Guardrails();
     const verifier = new Verifier(domTools);
     const agent = new AgentController(domTools, regionizer, guardrails, verifier,this.db);
-    const plan = await planTaskWithGemini(task);
+    const planresult = await planTaskWithGemini(task);
     // Log the generated plan to the UI
     this.sendMessage(wsClient, {
       type: 'status',
@@ -195,7 +197,8 @@ class Orchestrator {
         status: 'running',
         message:
           'Plan created:\n' +
-          plan.map((step, i) => `[${i}] ${step}`).join('\n'),
+          // FIX: Use planresult.steps and access .title
+          planresult.steps.map((step, i) => `[${i}] ${step.title}`).join('\n'),
       },
     });
 
@@ -211,7 +214,8 @@ class Orchestrator {
       paused: false,
       pendingAction: undefined,
       wsClient,
-      plan,
+      plan:planresult.steps,
+      strategy: planresult.strategy,
       planIndex:0,
       completedSteps:[],
       pausedForHumanObjective: undefined
@@ -270,14 +274,15 @@ class Orchestrator {
     }
 
     // Recompute after possible advance
-    const objectiveNow = session.plan[session.planIndex] || '';
+    const currentStep = session.plan[session.planIndex];
 
-    // If the current objective is human-owned (login/MFA), pause immediately.
-    if (isHumanOwnedObjective(objectiveNow) && isLoginLikeObjective(objectiveNow)) {
+    // FIX: Use the 'needsAuth' boolean flag instead of Regex
+    if (currentStep && currentStep.needsAuth) {
       session.paused = true;
       session.resume = true;
       session.pendingAction = undefined;
-      session.pausedForHumanObjective = objectiveNow;
+      // FIX: Store the title string, not the whole object
+      session.pausedForHumanObjective = currentStep.title;
 
       this.db.updateSessionStatus(sessionId, 'paused');
 
@@ -288,7 +293,8 @@ class Orchestrator {
           status: 'paused',
           pauseKind: 'ASK_USER',
           pendingAction: undefined,
-          message: `Please complete this step manually, then click Continue:\n${objectiveNow}`,
+          // FIX: Use title and description for the message
+          message: `AUTHENTICATION REQUIRED:\n${currentStep.title}\n\n${currentStep.description}\n\nPlease complete this manually, then click Continue.`,
         },
       });
 
@@ -316,25 +322,41 @@ class Orchestrator {
         regions,
       },
     });
-    const buildObjectivePrompt = (objective: string) => {
-    const completed = session.completedSteps;
-    const planPreview = session.plan.slice(0, 8);
 
-    return [
-      `ORIGINAL TASK:\n${session.task}`,
-      `\nPLAN:`,
-      ...planPreview.map((p, i) => `${i === session.planIndex ? '->' : '  '} [${i}] ${p}`),
-      completed.length ? `\nCOMPLETED:\n- ${completed.join('\n- ')}` : `\nCOMPLETED:\n(none)`,
-      `\nCURRENT OBJECTIVE:\n${objective}`,
-      `\nINSTRUCTIONS:\n- Focus ONLY on the CURRENT OBJECTIVE.\n- Do NOT redo completed objectives.\n- If the objective is already satisfied on the current page, return DONE.`,
-    ].join('\n');
-  };
 
     // Run agent loop
         // Run objectives sequentially until pause or completion
     while (session.planIndex < session.plan.length) {
-      const objective = session.plan[session.planIndex];
-      const objectivePrompt = buildObjectivePrompt(objective);
+      try {
+        const allPages = session.browser.getAllPages(); // Use the public method we added
+        const activePage = allPages[allPages.length - 1]; // Always grab the newest tab
+
+        if (activePage) {
+          // 1. Update the Browser Controller's reference
+          session.browser.setPage(activePage);
+
+          // 2. Update the DOM Tools reference
+          session.domTools.setPage(activePage);
+          
+          // 3. CRITICAL: Destroy and Re-create the Screenshot Manager
+          // This ensures we are taking pictures of the CURRENT page, not the old one.
+          session.screenshotManager = new ScreenshotManager(activePage);
+
+          // 4. Bring tab to front
+          await activePage.bringToFront();
+        }
+      } catch (err) {
+        console.log("⚠️ Page refresh warning:", err);
+      }
+      const stepData = session.plan[session.planIndex];
+      const objectivePrompt = `
+  STRATEGY: ${session.strategy}
+  CURRENT STEP: ${stepData.title}
+  GUIDANCE: ${stepData.description}
+
+  FULL PLAN:
+  ${session.plan.map(s => `[${s.id}] ${s.title}`).join('\n')}
+        `.trim();
 
       const result = await agent.runLoop(
         sessionId,
@@ -363,7 +385,7 @@ class Orchestrator {
           });
 
           if (phase === 'ACT' && action) {
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await new Promise(resolve => setTimeout(resolve, 2000));
             const screenshotBuffer = await screenshotManager.capture();
             const screenshotPath = this.traceManager.saveScreenshot(sessionId, stepNumber, screenshotBuffer);
 
@@ -389,7 +411,7 @@ class Orchestrator {
 
       // If objective completed, advance plan
       if (result.completed) {
-        session.completedSteps.push(objective);
+        session.completedSteps.push(stepData.title);
         session.planIndex++;
 
         this.sendMessage(wsClient, {
@@ -397,7 +419,7 @@ class Orchestrator {
           data: {
             sessionId,
             status: 'running',
-            message: `Objective completed: ${objective}`,
+            message: `Objective completed: ${stepData.title}`,
           },
         });
 

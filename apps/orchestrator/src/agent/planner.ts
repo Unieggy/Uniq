@@ -1,6 +1,7 @@
 import {config} from '../config.js';
-import { PlanSchema } from './schemas.js';
-function heuristicPlan(task: string): string[] {
+import { PlanSchema,PlanResult } from './schemas.js';
+
+function heuristicPlan(task: string): PlanResult {
   const normalized = task
     .replace(/\band then\b/gi, ' then ')
     .replace(/\bthen\b/gi, ' then ')
@@ -13,64 +14,55 @@ function heuristicPlan(task: string): string[] {
     .filter(Boolean);
 
   // Raw steps (no tags yet)
-  const raw = parts.length > 0 ? parts.slice(0, 6) : [task];
-  return enforceTags(task, raw);
-}
-function enforceTags(task: string, plan: string[]): string[] {
-  const needsLogin = /sign\s*in|log\s*in|login/i.test(task.toLowerCase());
+  const rawSteps = parts.length > 0 ? parts : [task];
 
-  // Tag every step if missing
-  const tagged = plan.map(s => {
-    const x = s.trim();
-    if (x.startsWith('[HUMAN]') || x.startsWith('[AGENT]')) return x;
-    return `[AGENT] ${x}`;
-  });
-
-  // Ensure human login step exists if needed
-  const hasHumanLogin = tagged.some(
-    s => s.startsWith('[HUMAN]') && /sign\s*in|log\s*in|login|mfa|otp|2fa/i.test(s)
-  );
-
-  if (needsLogin && !hasHumanLogin) {
-    return ['[HUMAN] Sign in', ...tagged].slice(0, 6);
-  }
-
-  return tagged.slice(0, 6);
+  return {
+    strategy: "System Offline: Falling back to simple heuristic parsing. Executing steps sequentially.",
+    steps: rawSteps.slice(0, 10).map((stepText, index) => ({
+      id: index + 1,
+      title: stepText,
+      description: `Action: ${stepText}`,
+      needsAuth: /login|sign in|password/i.test(stepText) // Basic regex for auth detection
+    }))
+  };
 }
 
-export async function planTaskWithGemini(task: string): Promise<string[]> {
+export async function planTaskWithGemini(task: string): Promise<PlanResult> {
   const apiKey = config.llm?.geminiApiKey;
   if (!apiKey || apiKey.startsWith('AIzaSyDbLt')){ 
     console.warn('Gemini API key not set or is a placeholder. Using heuristic planner.');
     return heuristicPlan(task)};
 
   const prompt = `
-You are a PLANNER for a browser automation agent.
-Your job is to break a high-level user task into a linear list of sequential steps.
+You are an expert Automation Strategist.
+Your goal is to create a robust execution plan for a browser agent.
 
-USER TASK: "${task}"
+USER REQUEST: "${task}"
 
-RULES:
-1. RESPONSE FORMAT: You must return ONLY a JSON object: { "plan": string[] }
-2. STEPS: Max 6 steps. Keep them short and concise.
-3. TAGS:
-   - Use "[HUMAN]" for steps requiring user interaction (Login, OTP, MFA, CAPTCHA, Payment).
-   - Use "[AGENT]" for steps the browser can do (Search, Click, Read, Navigate).
-4. LOGIN: If the task implies a specific service (like "Order Amazon"), assume the user is NOT logged in.
-   - Step 1 MUST be: "[HUMAN] Sign in and complete any MFA prompts"
-   - Do NOT ask for credentials in the plan.
+### INSTRUCTIONS:
+1. **MENTAL SIMULATION (The Strategy)**: 
+   - Before listing steps, "walk through" the website in your head.
+   - Predict specific tools (e.g., "UCSD uses WebReg", "Amazon uses a Cart").
+   - Anticipate "Gotchas" (e.g., "The 'Images' tab button becomes disabled when active", "Search results might be distinct from the home page").
 
-EXAMPLE JSON:
+2. **GENERATE STEPS**:
+   - Create granular, atomic steps.
+   - **DO NOT** assume the user needs to log in unless the task specifically requires private data (grades, shopping, settings).
+   - If the task is just "Search", "Find info", or "Browse", DO NOT include a Login step.
+   - **IMPORTANT**: If the user asks to "Find X and then click Y", ensure the first step is to Navigate/Search for X.
+
+### RESPONSE FORMAT (Strict JSON):
 {
-  "plan": [
-    "[HUMAN] Sign in and complete any MFA prompts",
-    "[AGENT] Search for 'ps5 console'",
-    "[AGENT] Click the first result",
-    "[AGENT] Click 'Add to Cart'"
+  "strategy": "Your high-level analysis of the workflow and tool prediction...",
+  "steps": [
+    {
+      "id": 1,
+      "title": "Short Objective (e.g. 'Navigate to Google')",
+      "description": "Detailed visual description of what to look for (e.g. 'Find the search bar center screen').",
+      "needsAuth": false
+    }
   ]
 }
-
-Respond with the JSON now.
 `.trim();
 
 
@@ -116,7 +108,7 @@ Respond with the JSON now.
     }
 
     // Apply the "[AGENT]" tags if Gemini forgot them
-    return enforceTags(task, validated.data.plan);
+    return validated.data
   } catch(error) {
     console.error('❌ PLANNER ERROR:', error);
     return heuristicPlan(task);
