@@ -231,6 +231,36 @@ export class DOMTools {
     await this.page.keyboard.type(value, { delay: 50 }); 
   }
 
+  /**
+   * Wait for the page to stabilize after an action.
+   * Uses navigation detection with fallback to networkidle.
+   * Replaces hardcoded sleeps throughout the codebase.
+   */
+  async waitForStability(timeoutMs: number = 5000): Promise<void> {
+    try {
+      // Race: either a navigation completes, or we settle for networkidle
+      await Promise.race([
+        this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: timeoutMs })
+          .then(() => this.page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {})),
+        this.page.waitForLoadState('networkidle', { timeout: timeoutMs }).catch(() => {}),
+      ]);
+    } catch {
+      // If everything times out, the page is likely already stable (no navigation happened).
+      // A brief pause covers minor DOM updates like modals or dropdowns.
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+
+  /**
+   * Scroll the page up or down by a given pixel amount.
+   */
+  async scroll(direction: 'up' | 'down', amount: number = 600): Promise<void> {
+    const delta = direction === 'down' ? amount : -amount;
+    await this.page.mouse.wheel(0, delta);
+    // Wait briefly for lazy-loaded content to render
+    await new Promise(r => setTimeout(r, 400));
+  }
+
   public setPage(page: import('playwright').Page): void {
     this.page = page;
   }

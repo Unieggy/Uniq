@@ -385,8 +385,9 @@ class Orchestrator {
           });
 
           if (phase === 'ACT' && action) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            const screenshotBuffer = await screenshotManager.capture();
+            // Wait for page stability instead of arbitrary sleep
+            await session.domTools.waitForStability();
+            const screenshotBuffer = await session.screenshotManager.capture();
             const screenshotPath = this.traceManager.saveScreenshot(sessionId, stepNumber, screenshotBuffer);
 
             const newRegions = await regionizer.detectRegions();

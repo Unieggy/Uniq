@@ -65,6 +65,12 @@ export const ActionSchema = z.discriminatedUnion('type', [
     regionId: z.string().optional(),
     description: z.string().optional(),
   }),
+  z.object({
+    type: z.literal('SCROLL'),
+    direction: z.enum(['up', 'down']),
+    amount: z.number().optional(), // pixels, defaults to 600
+    description: z.string().optional(),
+  }),
 
 ]);
 export type Action = z.infer<typeof ActionSchema>;

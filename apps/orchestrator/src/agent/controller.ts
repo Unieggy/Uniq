@@ -153,7 +153,7 @@ export class AgentController {
           continue;
         }
 
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await this.domTools.waitForStability();
 
         const urlAfter = this.domTools.getUrl();
         const titleAfter = await this.domTools.getTitle();
@@ -260,8 +260,8 @@ export class AgentController {
       const verification = await this.verifier.verify(validatedDecision.action);
       await onStep('VERIFY', verification.message);
 
-      // Wait a bit for page to settle
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Wait for page to stabilize after action (navigation or DOM update)
+      await this.domTools.waitForStability();
       const urlAfter = this.domTools.getUrl();
       const titleAfter = await this.domTools.getTitle();
       const textAfter = await this.domTools.getPageTextSnippet(400);
@@ -480,6 +480,10 @@ Allowed action types:
 4. ASK_USER: { "type":"ASK_USER", "message": string, "actionId"?: string }
 5. CONFIRM: { "type":"CONFIRM", "message": string, "actionId"?: string }
 6. DONE: { "type":"DONE", "reason"?: string }
+7. **SCROLL**: { "type":"SCROLL", "direction": "up" | "down", "amount"?: number, "description"?: string }
+   - Scrolls the page. Default amount is 600px (~one viewport).
+   - **USE THIS LIBERALLY.** Webpages are tall. You can only see the top portion. If you don't see the element or content you need, SCROLL DOWN before giving up.
+   - After scrolling, you will get fresh regions from the newly visible content.
 
 - KEY_PRESS: { "type":"KEY_PRESS", "key": string, "regionId"?: string, "description"?: string }
 
@@ -492,6 +496,13 @@ IMPORTANT:
 - Never use null. If a field is not needed, omit it entirely.
 - If no button exists, use KEY_PRESS "Enter" with the 'regionId' of the input field you just filled.
 - Review "SHORT-TERM MEMORY". If you see you just performed an action (like clicking a tab) and the URL hasn't changed, DO NOT repeat it. Try a different strategy (e.g. DOM_CLICK instead of VISION, or KEY_PRESS).
+
+DEFINITION OF DONE (Critical):
+- You are NOT done until you have extracted the ACTUAL CONTENT requested by the task.
+- A list of Google search results is NOT the answer. You must click into relevant pages and read the content.
+- If the task asks to "find", "research", "compare", or "recommend" something, you MUST visit multiple sources and read their content before returning DONE.
+- SCROLL DOWN on content pages to read full articles, reviews, and detailed information. Most useful content is below the fold.
+- Only return DONE when you have gathered enough information to synthesize a real answer.
 `.trim();
     try {
       const model='gemini-2.5-flash'; // Example model name
@@ -619,6 +630,10 @@ IMPORTANT:
       case 'CONFIRM':
         // These are handled by the orchestrator, not here
         throw new Error('ASK_USER and CONFIRM actions must be handled by orchestrator');
+
+      case 'SCROLL':
+        await this.domTools.scroll(action.direction, action.amount ?? 600);
+        break;
 
       case 'DONE':
         // No action needed

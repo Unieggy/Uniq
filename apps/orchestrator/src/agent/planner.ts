@@ -39,26 +39,47 @@ Your goal is to create a robust execution plan for a browser agent.
 
 USER REQUEST: "${task}"
 
+### STEP 0: CLASSIFY THE TASK
+Before planning, determine the task type:
+
+**TYPE A — Simple Action** (e.g., "What is 2+2?", "Go to google.com", "Click the first link"):
+- These need 1-3 steps. A search result page or a single page visit may be sufficient.
+
+**TYPE B — Deep Research** (e.g., "Find the best 4K monitor under $500", "Compare React vs Vue", "What laptop should I buy for coding?"):
+- These REQUIRE visiting multiple distinct pages (reviews, forums, comparison sites).
+- A Google Search results page is NEVER the final answer for research tasks.
+- You MUST include explicit steps to:
+  1. Search for the topic
+  2. Visit at least 2-3 credible sources (Reddit, specialized review sites, forums)
+  3. Scroll down on each page to read full content (articles are long!)
+  4. Synthesize findings into a final answer
+
+**TYPE C — Transactional** (e.g., "Buy X", "Book a flight", "Sign up for Y"):
+- Involves forms, carts, payments. May need authentication.
+
 ### INSTRUCTIONS:
-1. **MENTAL SIMULATION (The Strategy)**: 
+1. **MENTAL SIMULATION (The Strategy)**:
    - Before listing steps, "walk through" the website in your head.
    - Predict specific tools (e.g., "UCSD uses WebReg", "Amazon uses a Cart").
    - Anticipate "Gotchas" (e.g., "The 'Images' tab button becomes disabled when active", "Search results might be distinct from the home page").
+   - For research tasks, identify which sites would have the best info (e.g., "For monitors: rtings.com, reddit.com/r/monitors, tomshardware.com").
 
 2. **GENERATE STEPS**:
    - Create granular, atomic steps.
    - **DO NOT** assume the user needs to log in unless the task specifically requires private data (grades, shopping, settings).
    - If the task is just "Search", "Find info", or "Browse", DO NOT include a Login step.
    - **IMPORTANT**: If the user asks to "Find X and then click Y", ensure the first step is to Navigate/Search for X.
+   - **FOR RESEARCH TASKS**: Include steps like "Visit [source] and scroll to read full content", "Navigate back and visit next source". The agent can SCROLL pages — use this!
+   - **NEVER** end a research plan with just "View search results". Always include sub-page visits.
 
 ### RESPONSE FORMAT (Strict JSON):
 {
-  "strategy": "Your high-level analysis of the workflow and tool prediction...",
+  "strategy": "Your high-level analysis. State the task type (A/B/C) and your reasoning...",
   "steps": [
     {
       "id": 1,
       "title": "Short Objective (e.g. 'Navigate to Google')",
-      "description": "Detailed visual description of what to look for (e.g. 'Find the search bar center screen').",
+      "description": "Detailed visual description of what to look for (e.g. 'Find the search bar center screen'). For research steps, specify: what content to look for, how far to scroll, and what info to extract.",
       "needsAuth": false
     }
   ]
