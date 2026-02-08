@@ -18,7 +18,7 @@ import { WebSocket } from 'ws';
 import { randomUUID } from 'crypto';
 import { planTaskWithGemini } from './agent/planner.js';
 import { PlanResult } from './agent/schemas.js';
-import { tr } from 'zod/v4/locales';
+
 class Orchestrator {
   private server: Server;
   private db: DatabaseManager;
@@ -169,13 +169,71 @@ class Orchestrator {
 
     console.log(`Starting task for session ${sessionId}: ${task}`);
 
+    this.sendMessage(wsClient, {
+      type: 'status',
+      data: {
+        sessionId,
+        status: 'started',
+        message: 'Initializing Scout Phase',
+      },
+    });
+
+    let planResult: PlanResult;
+    try {
+        // Pass wsClient so planner can stream logs/popups to UI
+        planResult = await planTaskWithGemini(task, wsClient);
+    } catch (error) {
+        console.error('Planning failed:', error);
+        this.sendMessage(wsClient, { type: 'error', data: { message: 'Planning failed' } });
+        return;
+    }
+
+    // 3. Log the generated plan to UI
+    this.sendMessage(wsClient, {
+      type: 'status',
+      data: {
+        sessionId,
+        status: 'running',
+        message: 'Plan created:\n' + planResult.steps.map((step, i) => `[${i}] ${step.title}`).join('\n'),
+      },
+    });
+
     // Create session in database
     this.db.createSession(sessionId, task, config.startUrl);
+
+    // Notify user that main browser is launching
+    this.sendMessage(wsClient, {
+      type: 'status',
+      data: {
+        sessionId,
+        status: 'running',
+        message: '🌐 Launching main browser...'
+      }
+    });
 
     // Launch browser
     const browser = new BrowserController();
     await browser.launch();
+
+    this.sendMessage(wsClient, {
+      type: 'status',
+      data: {
+        sessionId,
+        status: 'running',
+        message: '🌐 Navigating to start page...'
+      }
+    });
+
     await browser.navigate(config.startUrl);
+
+    this.sendMessage(wsClient, {
+      type: 'status',
+      data: {
+        sessionId,
+        status: 'running',
+        message: '✓ Browser ready. Starting agent loop...'
+      }
+    });
 
     // Create tools
     if (!browser.page) {
@@ -188,19 +246,6 @@ class Orchestrator {
     const guardrails = new Guardrails();
     const verifier = new Verifier(domTools);
     const agent = new AgentController(domTools, regionizer, guardrails, verifier,this.db);
-    const planresult = await planTaskWithGemini(task);
-    // Log the generated plan to the UI
-    this.sendMessage(wsClient, {
-      type: 'status',
-      data: {
-        sessionId,
-        status: 'running',
-        message:
-          'Plan created:\n' +
-          // FIX: Use planresult.steps and access .title
-          planresult.steps.map((step, i) => `[${i}] ${step.title}`).join('\n'),
-      },
-    });
 
     // Store session
     this.activeSessions.set(sessionId, {
@@ -214,22 +259,14 @@ class Orchestrator {
       paused: false,
       pendingAction: undefined,
       wsClient,
-      plan:planresult.steps,
-      strategy: planresult.strategy,
+      plan:planResult.steps,
+      strategy: planResult.strategy,
       planIndex:0,
       completedSteps:[],
       pausedForHumanObjective: undefined
     });
 
-    // Send status
-    this.sendMessage(wsClient, {
-      type: 'status',
-      data: {
-        sessionId,
-        status: 'started',
-        message: 'Task started',
-      },
-    });
+    
 
     // Run agent loop
     this.runAgentLoop(sessionId).catch((error) => {
@@ -349,13 +386,36 @@ class Orchestrator {
         console.log("⚠️ Page refresh warning:", err);
       }
       const stepData = session.plan[session.planIndex];
+
+      // ===== PRE-NAVIGATION: If step has a verified targetUrl, navigate directly =====
+      if (stepData.targetUrl) {
+        this.sendMessage(wsClient, {
+          type: 'log',
+          data: {
+            step: session.stepCount,
+            phase: 'NAVIGATE',
+            message: `[Scout] Navigating directly to verified URL: ${stepData.targetUrl}`,
+            timestamp: new Date().toISOString(),
+          },
+        });
+
+        try {
+          await session.browser.navigate(stepData.targetUrl);
+          await session.domTools.waitForStability();
+        } catch (navError) {
+          console.warn(`[Scout] Direct navigation failed: ${navError}`);
+          // Continue anyway, agent will handle it
+        }
+      }
+
       const objectivePrompt = `
   STRATEGY: ${session.strategy}
   CURRENT STEP: ${stepData.title}
   GUIDANCE: ${stepData.description}
+  ${stepData.targetUrl ? `TARGET URL: ${stepData.targetUrl} (You should already be on this page)` : ''}
 
   FULL PLAN:
-  ${session.plan.map(s => `[${s.id}] ${s.title}`).join('\n')}
+  ${session.plan.map(s => `[${s.id}] ${s.title}${s.targetUrl ? ` → ${s.targetUrl}` : ''}`).join('\n')}
         `.trim();
 
       const result = await agent.runLoop(

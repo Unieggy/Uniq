@@ -85,13 +85,15 @@ export const DecisionSchema=z.object({
 export const PlanSchema = z.object({
   // 1. The Strategy: The AI's high-level analysis (Mental Simulation)
   strategy: z.string().describe("High-level reasoning and mental simulation of the workflow (e.g. 'This site requires SSO login...')."),
-  
+
   // 2. The Steps: Rich objects instead of just strings
   steps: z.array(z.object({
     id: z.number(),
     title: z.string().describe("Short objective (e.g. 'Search for chatgpt')"),
     description: z.string().describe("Detailed guidance on what to look for (e.g. 'Find the search bar at the top center')."),
     needsAuth: z.boolean().describe("True if this step involves login/MFA."),
+    // NEW: Optional verified URL from Pre-Planning Scout
+    targetUrl: z.string().optional().describe("Verified URL to navigate to (from scout search results). Only include if a specific URL was verified."),
   })).max(15)
 });
 

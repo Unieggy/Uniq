@@ -9,11 +9,8 @@ import { Guardrails } from '../policy/guardrails.js';
 import { Verifier } from '../verify/verifier.js';
 import { DOMTools } from '../browser/domTools.js';
 import { Regionizer } from '../vision/regionizer.js';
-import {config} from '../config.js';
-import { text } from 'stream/consumers';
-import { tr } from 'zod/v4/locales';
-import { DatabaseManager }  from '../storage/db.js';
-import { url } from 'inspector';
+import { config } from '../config.js';
+import { DatabaseManager } from '../storage/db.js';
 export class AgentController {
   private stepCount = 0;
   private maxSteps = 50; // Safety limit
@@ -28,6 +25,13 @@ export class AgentController {
     textBefore: string;
     textAfter: string;
   } | undefined;
+
+  // Auto-scroll state
+  private scrollCount = 0;
+  private maxAutoScrolls = 5;
+  private lastScrollPageText = '';
+  private contentVisible = false;
+  private bottomReached = false;
 
   constructor(
     private domTools: DOMTools,
@@ -52,6 +56,10 @@ export class AgentController {
       this.stepCount = 0;
       this.lastAction = undefined;
       this.lastOutcome = undefined;
+      this.scrollCount = 0;
+      this.lastScrollPageText = '';
+      this.contentVisible = false;
+      this.bottomReached = false;
     }
 
       
@@ -183,6 +191,70 @@ export class AgentController {
       }
       // ====== END AUTO-RECOVERY ======
 
+      // ====== AUTO-SCROLL: semantic content-aware scrolling ======
+      if (!this.contentVisible && this.scrollCount < this.maxAutoScrolls && !this.bottomReached) {
+        const autoScrollPageText = await this.domTools.getPageText();
+        const elementLabels = regions.map(r => r.label).filter(Boolean) as string[];
+
+        // Reset scroll state if URL changed (navigated to new page)
+        if (this.lastOutcome && this.lastOutcome.urlBefore !== this.lastOutcome.urlAfter) {
+          this.scrollCount = 0;
+          this.lastScrollPageText = '';
+          this.contentVisible = false;
+          this.bottomReached = false;
+        }
+
+        const visible = await this.checkSemanticVisibility(task, autoScrollPageText, elementLabels);
+
+        if (visible) {
+          this.contentVisible = true;
+          console.log('[auto-scroll] Semantic check: target content IS visible. Handing off to LLM.');
+          // Fall through to DECIDE
+        } else {
+          const currentSnippet = autoScrollPageText.slice(0, 3000);
+
+          // Bottom detection: if page text didn't change since last scroll, stop
+          if (this.lastScrollPageText && this.lastScrollPageText === currentSnippet) {
+            this.bottomReached = true;
+            console.log('[auto-scroll] Bottom of page reached — no more content below.');
+          } else {
+            this.lastScrollPageText = currentSnippet;
+            this.scrollCount++;
+            console.log(`[auto-scroll] Semantic check: target NOT visible (${this.scrollCount}/${this.maxAutoScrolls}). Scrolling down...`);
+            await onStep('OBSERVE', `Auto-scroll: target content not yet visible (${this.scrollCount}/${this.maxAutoScrolls})`);
+
+            const urlBefore = this.domTools.getUrl();
+            const titleBefore = await this.domTools.getTitle();
+            const textBefore = await this.domTools.getPageTextSnippet(400);
+
+            await this.domTools.scroll('down', 600);
+            await this.domTools.waitForStability();
+
+            const urlAfter = this.domTools.getUrl();
+            const titleAfter = await this.domTools.getTitle();
+            const textAfter = await this.domTools.getPageTextSnippet(400);
+
+            this.lastAction = {
+              type: 'SCROLL',
+              direction: 'down',
+              amount: 600,
+              description: `Auto-scroll ${this.scrollCount}/${this.maxAutoScrolls}`,
+            };
+            this.lastOutcome = {
+              stateChanged: textBefore !== textAfter,
+              urlBefore,
+              urlAfter,
+              titleBefore,
+              titleAfter,
+              textBefore,
+              textAfter,
+            };
+
+            continue; // re-observe
+          }
+        }
+      }
+      // ====== END AUTO-SCROLL ======
 
       // DECIDE
       await onStep('DECIDE', `Step ${this.stepCount}: Deciding next action`);
@@ -377,6 +449,69 @@ export class AgentController {
       confidence: 0.3,
     };
   }
+  private async checkSemanticVisibility(
+    task: string,
+    visibleText: string,
+    interactiveElements: string[],
+  ): Promise<boolean> {
+    const apiKey = config.llm?.geminiApiKey;
+    if (!apiKey) return true; // No key → skip auto-scroll, let main LLM decide
+
+    // Extract the current step for a focused check
+    const stepMatch = task.match(/CURRENT STEP:\s*(.+?)(?:\n|$)/i);
+    const objective = stepMatch ? stepMatch[1].trim() : task.slice(0, 200);
+
+    const truncatedText = visibleText.slice(0, 2000);
+    const elementsStr = interactiveElements.slice(0, 30).join(', ');
+
+    const prompt = `You are checking whether a webpage currently shows content relevant to a task.
+
+TASK OBJECTIVE: ${objective}
+
+VISIBLE PAGE TEXT (truncated):
+${truncatedText}
+
+CLICKABLE ELEMENTS ON PAGE:
+${elementsStr}
+
+Does this page currently show content, links, or interactive elements that are semantically relevant to the task objective? Think broadly:
+- Synonyms count (e.g., "Dining" is relevant for "Food", "Catalog" is relevant for "Classes")
+- Navigation links or buttons that would lead to the target content count as relevant
+- Section headers or menu items related to the objective count as relevant
+- If the page is a search engine results page with links to explore, that IS relevant
+
+Respond with ONLY the word "YES" or "NO".`.trim();
+
+    try {
+      const model = 'gemini-2.0-flash-lite';
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 8 },
+        }),
+      });
+
+      if (!res.ok) {
+        console.warn(`[auto-scroll] Semantic check failed (${res.status}), skipping auto-scroll.`);
+        return true; // On failure, skip auto-scroll
+      }
+
+      const json = (await res.json()) as any;
+      const answer: string | undefined = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!answer) return true;
+
+      const result = answer.trim().toUpperCase().startsWith('YES');
+      console.log(`[auto-scroll] Semantic visibility check: ${result ? 'YES' : 'NO'} (objective: "${objective.slice(0, 60)}")`);
+      return result;
+    } catch (err) {
+      console.warn('[auto-scroll] Semantic check error:', err);
+      return true; // On error, skip auto-scroll
+    }
+  }
+
   private extractFirstJsonObject(text: string): string | null{
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
@@ -447,6 +582,9 @@ ${JSON.stringify(
   2
 )}
 
+SCROLL STATUS:
+Auto-scrolled ${this.scrollCount} time(s) on this page. Target content is ${this.contentVisible ? 'VISIBLE' : 'NOT YET VISIBLE'}.${this.bottomReached ? '\nBottom of page reached — no more content below.' : ''}${this.scrollCount >= this.maxAutoScrolls ? '\nMax auto-scrolls reached.' : ''}
+
 INTERACTIVE REGIONS (choose by id):
 ${JSON.stringify(regionchoices, null, 2)}
 
@@ -475,19 +613,23 @@ Allowed action types:
 
 2. **VISION_FILL** / **DOM_FILL**:
    - MUST include "regionId" AND "value".
-   - Example: { "type": "VISION_FILL", "regionId": "element-123", "value": "search term" }
+   - The "value" MUST come from the TASK, CURRENT STEP, or GUIDANCE text. NEVER invent or guess fill values.
+   - Example: { "type": "VISION_FILL", "regionId": "element-123", "value": "exact text from task" }
 3. WAIT: { "type":"WAIT", "duration"?: number, "until"?: string, "description"?: string }
 4. ASK_USER: { "type":"ASK_USER", "message": string, "actionId"?: string }
 5. CONFIRM: { "type":"CONFIRM", "message": string, "actionId"?: string }
 6. DONE: { "type":"DONE", "reason"?: string }
 7. **SCROLL**: { "type":"SCROLL", "direction": "up" | "down", "amount"?: number, "description"?: string }
    - Scrolls the page. Default amount is 600px (~one viewport).
-   - **USE THIS LIBERALLY.** Webpages are tall. You can only see the top portion. If you don't see the element or content you need, SCROLL DOWN before giving up.
-   - After scrolling, you will get fresh regions from the newly visible content.
+   - **NOTE**: The system has an auto-scroll feature that scrolls BEFORE you are called. Check the SCROLL STATUS section above.
+   - If SCROLL STATUS says "Target content is VISIBLE", the content you need is already on screen — work with it.
+   - If SCROLL STATUS says "Bottom of page reached", there is no more content below — do NOT scroll down further.
+   - Only use SCROLL manually if you need to scroll UP, or if you need to see specific content the auto-scroll missed.
 
-- KEY_PRESS: { "type":"KEY_PRESS", "key": string, "regionId"?: string, "description"?: string }
+8. KEY_PRESS: { "type":"KEY_PRESS", "key": string, "regionId"?: string, "description"?: string }
 
 IMPORTANT:
+- **FILL VALUES**: Only use text that is explicitly stated in the TASK or CURRENT STEP. If the step says "Search for OpenAI demos", the fill value is "OpenAI demos". If the step does NOT mention what to type, do NOT fill anything — return ASK_USER instead.
 - The initial page starts as unsigned-in. So if the task involves personal data, accounts, or payments..etc you must first sign in.
 - If this page requires credentials, login, payment, or MFA, return ASK_USER with a clear message telling the human what to do, and do NOT attempt to fill passwords.
 - If you are unsure, return ASK_USER instead of guessing.
@@ -496,12 +638,12 @@ IMPORTANT:
 - Never use null. If a field is not needed, omit it entirely.
 - If no button exists, use KEY_PRESS "Enter" with the 'regionId' of the input field you just filled.
 - Review "SHORT-TERM MEMORY". If you see you just performed an action (like clicking a tab) and the URL hasn't changed, DO NOT repeat it. Try a different strategy (e.g. DOM_CLICK instead of VISION, or KEY_PRESS).
+- **STAY ON TASK**: Only perform actions described in the CURRENT STEP. Do not jump ahead to future steps in the plan.
 
 DEFINITION OF DONE (Critical):
 - You are NOT done until you have extracted the ACTUAL CONTENT requested by the task.
 - A list of Google search results is NOT the answer. You must click into relevant pages and read the content.
 - If the task asks to "find", "research", "compare", or "recommend" something, you MUST visit multiple sources and read their content before returning DONE.
-- SCROLL DOWN on content pages to read full articles, reviews, and detailed information. Most useful content is below the fold.
 - Only return DONE when you have gathered enough information to synthesize a real answer.
 `.trim();
     try {
