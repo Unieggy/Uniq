@@ -74,7 +74,7 @@ YOUR RESPONSE (just the query or NULL, nothing else):
 `.trim();
 
   try {
-    const model = 'gemini-2.5-flash';
+    const model = 'gemini-3-flash-preview';
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
     const res = await fetch(endpoint, {
@@ -509,7 +509,7 @@ Before planning, determine the task type:
 
 
   try {
-    const model = 'gemini-2.5-flash';
+    const model = 'gemini-3-flash-preview';
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
     const res = await fetch(endpoint, {

@@ -590,7 +590,7 @@ Does this page currently show content, links, or interactive elements that are s
 Respond with ONLY the word "YES" or "NO".`.trim();
 
     try {
-      const model = 'gemini-2.0-flash-lite';
+      const model = 'gemini-2.5-flash';
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -775,7 +775,7 @@ DEFINITION OF DONE (Critical):
 - Only return DONE when you have gathered enough information to synthesize a real answer.
 `.trim();
     try {
-      const model='gemini-2.5-flash'; // Example model name
+      const model='gemini-3-flash-preview';
       const endpoint=`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
       const res=await fetch(endpoint,{
         method:'POST',
