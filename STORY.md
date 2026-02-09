@@ -18,9 +18,9 @@ $$
 A(s_t) = \text{argmax}_a \; P(\text{success} \mid s_t, a, \pi_\theta)
 $$
 
-Where $s_t$ is the current page state (DOM regions, URL, screenshot), $a$ is a candidate action (click, type, scroll), and $\pi_\theta$ represents the Gemini-powered policy that scores actions based on the current objective.
+Where $s_t$ is the current page state (DOM regions, URL, visible text), $a$ is a candidate action (click, type, scroll), and $\pi_\theta$ represents the Gemini-powered policy that scores actions based on the current objective.
 
-In practice, this manifests as a four-phase loop: **OBSERVE** the page, **DECIDE** the next action, **ACT** on the browser, and **VERIFY** the result.
+In practice, this manifests as a multi-phase loop: **OBSERVE** the page, **AUTO-RECOVER** from failed submissions, **AUTO-SCROLL** using semantic content detection, **DECIDE** the next action, **ACT** on the browser, **VERIFY** the result, and for research tasks, **SYNTHESIZE** findings into a final answer.
 
 ---
 
@@ -38,7 +38,7 @@ The key insight was separating *planning* from *execution*. When a user submits 
 
 Each step becomes an "objective" that the agent pursues until completion, then moves to the next.
 
-The DOM is scanned for interactive regions (buttons, links, input fields) using Playwright's accessibility tree. These regions are passed to Gemini along with a screenshot and the current objective. Gemini returns a structured action (click region 7, type "mechanical keyboard", scroll down). The action is executed and verified.
+The DOM is scanned for interactive regions (buttons, links, inputs, textareas) using Playwright selectors with a cursor:pointer fallback for custom elements. Each region is tagged with a stable `data-agent-id` attribute directly on the DOM node, so the locator survives dynamic page changes. Regions carry semantic metadata: a human-readable label, a role (button, input, textarea, link, etc.), and optionally an href. These regions are passed to Gemini along with 4000 characters of visible page text and the current objective. Gemini returns a structured action (click region "element-abc123", type "mechanical keyboard", scroll down). The action is executed with human-like cursor physics and verified.
 
 SQLite logs every session, every step, every decision. If something goes wrong, you can trace exactly what the agent saw and why it made that choice.
 
@@ -46,53 +46,51 @@ SQLite logs every session, every step, every decision. If something goes wrong, 
 
 ## The Challenges
 
-Two bugs nearly broke me.
+Each bug was a lesson in how fragile browser automation really is.
 
 ### The Zombie Page
 
-The first was what I started calling the "Zombie Page" bug. Sometimes the agent would click a link that opened a new tab. The browser would dutifully open that tab. But the agent? It kept operating on the original page. A ghost page. A zombie.
+Sometimes the agent would click a link that opened a new tab. The browser would dutifully open that tab. But the agent kept operating on the original page. A ghost page. A zombie.
 
-The agent would take screenshots of a blank or stale page. It would try to click elements that did not exist anymore. The logs would show actions being taken, but nothing would change. I spent hours staring at console output, wondering why the agent had gone insane.
-
-The fix was embarrassingly simple once I found it. In the main loop, before every iteration, I now grab the newest page:
-
-```typescript
-const allPages = session.browser.getAllPages();
-const activePage = allPages[allPages.length - 1];
-session.browser.setPage(activePage);
-session.domTools.setPage(activePage);
-session.screenshotManager = new ScreenshotManager(activePage);
-await activePage.bringToFront();
-```
-
-Always track the newest tab. Always update all the references. Never let the agent operate on a zombie.
+The fix: before every loop iteration, grab the newest page and update all references. Always track the newest tab. Never let the agent operate on a zombie.
 
 ### The Lazy Agent
 
-The second bug was more insidious. I called it the "Lazy Agent" problem.
+When I asked the agent to research a topic, it would go to Google, type the query, see the search results, and declare: "Objective complete." That is not research. That is a Google search.
 
-When I asked the agent to research a topic, it would dutifully go to Google, type the query, and see the search results. Then it would declare: "Objective complete."
+The fix was prompt engineering: explicit task classification (simple action vs. deep research vs. transactional), a "mental simulation" requirement where Gemini walks through the site in its head before generating steps, and a hard rule that search results pages are never the final answer.
 
-No. That is not research. That is a Google search. Research means clicking through to actual articles. Reading them. Scrolling down. Visiting multiple sources. Comparing information.
+### The Phantom Click
 
-The agent was being lazy. It found the path of least resistance and stopped.
+The agent would scan the page, find 144 interactive elements, and tell Gemini to click a video thumbnail. But the click would hit a completely different element — a hidden "Confirm" button inside the YouTube player.
 
-The fix was pure prompt engineering. In the planner prompt, I added explicit classification:
+The root cause was subtle. Playwright's `.all()` returns positional locators (`.nth(94)` = the 94th match). Between scan time and click time, YouTube dynamically loaded player controls, shifting every index. `.nth(94)` silently drifted to the wrong element.
 
-> **TYPE B — Deep Research**: These REQUIRE visiting multiple distinct pages. A Google Search results page is NEVER the final answer for research tasks. You MUST include explicit steps to scroll down on each page to read full content.
+The fix was identity-based locators. During scan, each element is stamped with a `data-agent-id` attribute directly on the DOM node. The stored locator uses `[data-agent-id="element-abc123"]` — an attribute selector that finds the exact same node regardless of what the page adds or removes afterwards.
 
-I also added a "mental simulation" requirement where Gemini has to "walk through" the website in its head before generating steps. Predict what tools the site uses. Anticipate gotchas. This forces the model to actually think instead of pattern-matching to the simplest solution.
+### The Premature DONE
 
-There was also a race condition in waiting for page stability. After an action, how do you know the page is ready? I used `Promise.race` to compete between a navigation event and network idle:
+When Gemini returned a malformed response (missing `confidence` field, broken JSON), the heuristic fallback immediately returned DONE. This cascaded — every remaining objective was skipped because the agent thought the task was finished.
 
-```typescript
-await Promise.race([
-  this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: timeoutMs }),
-  this.page.waitForLoadState('networkidle', { timeout: timeoutMs }),
-]);
-```
+The fix was two-fold: auto-patch malformed responses (fill in missing `confidence` with 0.5 instead of discarding the action), and replace the instant DONE fallback with a graduated strategy (SCROLL → WAIT → then DONE). Three chances to recover instead of zero.
 
-Whichever comes first, we proceed. This handles both single-page apps that never "navigate" and traditional pages that do.
+### The Zombie Step
+
+The agent was too smart for its own plan. While executing step 0 ("Navigate to YouTube"), it saw the search bar, searched, and clicked the video — accomplishing steps 1, 2, and 3 in one go. But the plan controller only advanced one step. So it forced the agent to re-execute step 1 ("Type search query") on the video page.
+
+The fix was fast-forward logic: after each objective completes, check if subsequent steps are already accomplished by the current URL. Skip them instead of re-executing. The agent should never redo work it already did.
+
+### The SPA Graveyard
+
+On LinkedIn and YouTube, `scanPage()` would find 0 interactive elements. The page had navigated, but React had not hydrated yet. With no elements to interact with, the agent gave up.
+
+The fix was a retry with patience: if 0 regions are found on a real page, wait for network idle plus 3 seconds, then scan again. Heavy SPAs need time.
+
+### The Stability Trap
+
+`waitForStability()` waited for `networkidle` — but sites like Amazon and YouTube never go idle. Analytics pings, ad tracking, WebSocket heartbeats. The agent would stall for 5 seconds after every single action, and the function was being called twice (once in the callback, once in verify).
+
+The fix: cap the networkidle wait at 1.5 seconds, and remove the duplicate call. The agent went from sluggish to responsive.
 
 ---
 
@@ -104,13 +102,17 @@ Building this taught me things I could not have learned from tutorials.
 
 **LLMs are lazy by default.** They will find the shortest path to something that looks like success. If you want thorough behavior, you have to demand it explicitly. You have to close every loophole in the prompt. "Research" means nothing to a model. "Visit at least 3 distinct sources and scroll to read full content" means something.
 
-**State management is everything.** The browser is stateful. Tabs open and close. Pages navigate. Elements appear and disappear. The agent must constantly re-observe its environment. The moment it relies on stale state, it becomes a zombie operating on ghosts.
+**LLMs are also fragile.** They will randomly omit a required JSON field, return broken syntax, or hallucinate an element ID. You cannot treat LLM output as reliable. You must auto-patch, validate, and have graduated fallbacks. The system should degrade gracefully, not crash.
 
-**The 80/20 rule is real.** Getting the basic loop working took 20% of the time. Handling edge cases (new tabs, lazy completions, network timeouts, authentication flows) took the other 80%. The demos always look easy. The production code never is.
+**State management is everything.** The browser is stateful. Tabs open and close. Pages navigate. Elements appear and disappear. The DOM shifts under your feet. Positional references go stale. The agent must constantly re-observe its environment. The moment it relies on stale state, it becomes a zombie operating on ghosts.
 
-I am proud of what this became. An agent that can actually research. That can scroll through articles and visit multiple sources. That knows when to ask for human help and when to proceed on its own.
+**The agent will outrun its plan.** A smart LLM will accomplish multiple plan steps in a single execution. The orchestrator must detect this and fast-forward instead of forcing the agent to redo work. The plan is a guide, not a prison.
 
-It is not Atlas. But it is mine. And it works.
+**The 80/20 rule is real.** Getting the basic loop working took 20% of the time. Handling edge cases (new tabs, lazy completions, network timeouts, authentication flows, SPA hydration, dynamic DOM shifts, noisy network idle) took the other 80%. The demos always look easy. The production code never is.
+
+I am proud of what this became. A pure DOM-based agent — no vision model, no screenshots for decision-making — that navigates the real web. It can research topics across multiple sources and synthesize findings. It handles SPAs, dynamic content, multi-language queries, and authentication flows. It knows when to ask for human help and when to proceed on its own.
+
+It is not Atlas, it is mine. And it works.
 
 ---
 
