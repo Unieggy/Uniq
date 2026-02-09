@@ -39,8 +39,8 @@ class Orchestrator {
     planIndex: number;
     completedSteps: string[];
     pausedForHumanObjective?: string;
-    strategy:string
-
+    strategy:string;
+    researchNotes: string[];
 
   }> = new Map();
 
@@ -263,7 +263,8 @@ class Orchestrator {
       strategy: planResult.strategy,
       planIndex:0,
       completedSteps:[],
-      pausedForHumanObjective: undefined
+      pausedForHumanObjective: undefined,
+      researchNotes: [],
     });
 
     
@@ -408,7 +409,13 @@ class Orchestrator {
         }
       }
 
+      const notesContext = session.researchNotes.length > 0
+        ? `\nRESEARCH NOTES SO FAR:\n${session.researchNotes.join('\n---\n').slice(-3000)}`
+        : '';
+
       const objectivePrompt = `
+  ORIGINAL USER TASK: ${session.task}
+
   STRATEGY: ${session.strategy}
   CURRENT STEP: ${stepData.title}
   GUIDANCE: ${stepData.description}
@@ -416,6 +423,7 @@ class Orchestrator {
 
   FULL PLAN:
   ${session.plan.map(s => `[${s.id}] ${s.title}${s.targetUrl ? ` → ${s.targetUrl}` : ''}`).join('\n')}
+  ${notesContext}
         `.trim();
 
       const result = await agent.runLoop(
@@ -472,6 +480,17 @@ class Orchestrator {
 
       // If objective completed, advance plan
       if (result.completed) {
+        // Extract page content as research note
+        try {
+          const pageText = await session.domTools.getVisibleText();
+          const note = pageText.slice(0, 2000);
+          if (note.length > 50) {
+            session.researchNotes.push(`[${stepData.title}]\n${note}`);
+          }
+        } catch (err) {
+          console.warn('[research-notes] Failed to extract page text:', err);
+        }
+
         session.completedSteps.push(stepData.title);
         session.planIndex++;
 
@@ -522,6 +541,31 @@ class Orchestrator {
       return;
     }
 
+    // Synthesize research findings if notes were collected
+    if (session.researchNotes.length > 0) {
+      this.sendMessage(wsClient, {
+        type: 'log',
+        data: {
+          step: session.stepCount + 1,
+          phase: 'DECIDE',
+          message: 'Synthesizing research findings...',
+          timestamp: new Date().toISOString(),
+        },
+      });
+
+      const synthesis = await this.synthesizeFindings(session.task, session.researchNotes);
+
+      this.sendMessage(wsClient, {
+        type: 'log',
+        data: {
+          step: session.stepCount + 1,
+          phase: 'DECIDE',
+          message: `RESEARCH FINDINGS:\n\n${synthesis}`,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+
     // All objectives completed — keep browser open for user to inspect results
     this.db.updateSessionStatus(sessionId, 'completed');
     this.sendMessage(wsClient, {
@@ -529,11 +573,54 @@ class Orchestrator {
       data: {
         sessionId,
         status: 'completed',
-        message: 'All objectives completed. Browser is still open — click Stop when done.',
+        message: session.researchNotes.length > 0
+          ? 'All objectives completed. Research synthesis sent above. Browser is still open — click Stop when done.'
+          : 'All objectives completed. Browser is still open — click Stop when done.',
       },
     });
     return;
 
+  }
+
+  private async synthesizeFindings(task: string, researchNotes: string[]): Promise<string> {
+    const apiKey = config.llm?.geminiApiKey;
+    if (!apiKey) return 'No API key configured for synthesis.';
+
+    const notesText = researchNotes.join('\n---\n').slice(-6000);
+    const prompt = `You are a research assistant. The user asked an AI browser agent to perform the following task:
+
+TASK: ${task}
+
+The agent visited several pages and collected these notes:
+
+${notesText}
+
+Based on these research notes, provide a concise, well-organized answer to the user's original task. Include specific facts, names, numbers, and URLs where relevant. If the notes are insufficient, say what was found and what is still missing.`;
+
+    try {
+      const model = 'gemini-2.5-flash';
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.3, maxOutputTokens: 1500 },
+        }),
+      });
+
+      if (!res.ok) {
+        console.warn(`[synthesis] Gemini request failed (${res.status})`);
+        return 'Synthesis failed — could not reach LLM.';
+      }
+
+      const json = (await res.json()) as any;
+      const text: string | undefined = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+      return text?.trim() || 'No synthesis generated.';
+    } catch (err) {
+      console.warn('[synthesis] Error:', err);
+      return 'Synthesis failed due to an error.';
+    }
   }
 
   private sendMessage(wsClient: WebSocket | undefined, message: WebSocketMessage): void {

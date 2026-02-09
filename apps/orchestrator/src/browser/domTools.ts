@@ -20,7 +20,7 @@ export class DOMTools {
   /**
    * Scans the page, saves elements to memory, and returns the list to the AI.
    */
-  async scanPage(): Promise<Region[]> {
+  async scanPage(isRetry = false): Promise<Region[]> {
     // 1. Clear old memory. We are looking at a new page state now.
     this.elementStore.clear();
     const regions: Region[] = [];
@@ -92,21 +92,99 @@ export class DOMTools {
         seenHrefs.add(href);
       }
 
+      // Derive semantic role from tag and aria attributes
+      const ariaRole = await target.getAttribute('role');
+      const regionRole = this.deriveRole(targetTag, ariaRole);
+
       const id = `element-${randomUUID().slice(0, 8)}`;
       this.elementStore.set(id, target);
 
       regions.push({
         id: id,
         label: label,
+        role: regionRole,
         bbox: { x: bbox.x, y: bbox.y, w: bbox.width, h: bbox.height },
         confidence: 1.0,
         ...(href ? { href } : {}),
       });
     }
 
+    // 6. Fallback: if very few regions found, sweep for cursor:pointer elements
+    if (regions.length < 5) {
+      console.log(`[scanPage] Only ${regions.length} regions from selectors. Running cursor:pointer fallback...`);
+      const pointerElements = await this.page.evaluate(`
+        (() => {
+          const results = [];
+          const seen = new Set();
+          const all = document.querySelectorAll('*');
+          for (const el of all) {
+            if (seen.has(el)) continue;
+            const style = window.getComputedStyle(el);
+            if (style.cursor !== 'pointer') continue;
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 5 || rect.height < 5) continue;
+            if (rect.top > window.innerHeight || rect.bottom < 0) continue;
+            let skip = false;
+            let parent = el.parentElement;
+            while (parent) {
+              if (seen.has(parent)) { skip = true; break; }
+              parent = parent.parentElement;
+            }
+            if (skip) continue;
+            seen.add(el);
+            const tag = el.tagName.toLowerCase();
+            const ariaLabel = el.getAttribute('aria-label') || '';
+            const text = (el.innerText || '').slice(0, 100).trim();
+            const href = el.getAttribute('href') || (el.closest('a') ? el.closest('a').href : '') || '';
+            results.push({ tag, text, ariaLabel, href, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } });
+            if (results.length >= 40) break;
+          }
+          return results;
+        })()
+      `) as { tag: string; text: string; ariaLabel: string; href: string; rect: { x: number; y: number; w: number; h: number } }[];
+
+      for (const pe of pointerElements) {
+        const label = (pe.ariaLabel || pe.text || `Clickable ${pe.tag}`).replace(/\s+/g, ' ').trim().slice(0, 100);
+        if (!label || label.length === 0) continue;
+        if (pe.href && seenHrefs.has(pe.href)) continue;
+        if (pe.href) seenHrefs.add(pe.href);
+
+        const id = `element-${randomUUID().slice(0, 8)}`;
+        // Build a locator from the element's text or position
+        const searchText = pe.text.slice(0, 40).replace(/"/g, '\\"');
+        const locator = searchText.length > 2
+          ? this.page.locator(`${pe.tag}:visible`).filter({ hasText: searchText }).first()
+          : this.page.locator(`${pe.tag}[aria-label="${pe.ariaLabel.replace(/"/g, '\\"')}"]`).first();
+        this.elementStore.set(id, locator);
+
+        regions.push({
+          id,
+          label,
+          role: this.deriveRole(pe.tag, null),
+          bbox: pe.rect,
+          confidence: 0.7,
+          ...(pe.href ? { href: pe.href } : {}),
+        });
+      }
+      console.log(`[scanPage] cursor:pointer fallback added ${pointerElements.length} elements. Total: ${regions.length}`);
+    }
+
+    // 7. SPA retry: if 0 regions on a real page, wait for network idle + extra time, then retry once
+    if (regions.length === 0 && !isRetry) {
+      const url = this.page.url();
+      const isRealPage = url && !url.startsWith('about:') && url !== 'chrome://newtab/';
+      if (isRealPage) {
+        console.log('[scanPage] 0 regions on a real page. Waiting for network idle + 3s for SPA hydration...');
+        await this.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 3000));
+        return this.scanPage(true);
+      }
+    }
+
     return regions;
   }
-  
+
   /**
    * Press a key on a specific region (ensures focus)
    */
@@ -313,6 +391,22 @@ export class DOMTools {
     await this.page.mouse.wheel(0, delta);
     // Wait briefly for lazy-loaded content to render
     await new Promise(r => setTimeout(r, 400));
+  }
+
+  private deriveRole(tag: string, ariaRole: string | null): Region['role'] {
+    const t = tag.toLowerCase();
+    if (t === 'a') return 'link';
+    if (t === 'button') return 'button';
+    if (t === 'textarea') return 'textarea';
+    if (t === 'select') return 'select';
+    if (t === 'input') return 'input';
+    // Check aria role overrides
+    const r = (ariaRole || '').toLowerCase();
+    if (r === 'link') return 'link';
+    if (r === 'button') return 'button';
+    if (r === 'checkbox') return 'checkbox';
+    if (r === 'radio') return 'radio';
+    return 'other';
   }
 
   public setPage(page: import('playwright').Page): void {

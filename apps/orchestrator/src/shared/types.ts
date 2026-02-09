@@ -5,6 +5,7 @@
 export interface Region {
   id: string;
   label: string;
+  role: 'link' | 'button' | 'input' | 'textarea' | 'select' | 'checkbox' | 'radio' | 'other';
   bbox: {
     x: number;
     y: number;

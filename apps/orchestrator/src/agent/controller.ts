@@ -16,6 +16,7 @@ export class AgentController {
   private maxSteps = 50; // Safety limit
   private lastAction: Action | undefined;
   private postFillSubmitTries = 0;
+  private consecutiveFailures = 0;
   private lastOutcome: {
     stateChanged: boolean;
     urlBefore: string;
@@ -63,6 +64,7 @@ export class AgentController {
       this.bottomReached = false;
       this.lastScrollY = 0;
       this.lastScrollHeight = 0;
+      this.consecutiveFailures = 0;
     }
 
       
@@ -86,6 +88,7 @@ export class AgentController {
         this.bottomReached = false;
         this.lastScrollY = 0;
         this.lastScrollHeight = 0;
+        this.consecutiveFailures = 0;
         this.lastUrl = currentUrl;
       }
 
@@ -228,14 +231,24 @@ export class AgentController {
           const heightStuck = geoBefore.scrollHeight === this.lastScrollHeight;
           const atDocumentBottom = geoBefore.scrollY + geoBefore.viewportHeight >= geoBefore.scrollHeight - 5;
 
-          if (this.scrollCount > 0 && scrollYStuck && heightStuck) {
+          // Guard: if scrollY is 0 and scrollHeight equals viewport, the page likely
+          // uses an inner scroll container (LinkedIn, etc.) or hasn't loaded yet.
+          // Don't declare bottom — let the loop scroll and re-check.
+          const pageUnscrollable = geoBefore.scrollY === 0 &&
+            Math.abs(geoBefore.scrollHeight - geoBefore.viewportHeight) < 10;
+
+          if (this.scrollCount > 0 && scrollYStuck && heightStuck && !pageUnscrollable) {
             // Scroll didn't move AND page didn't grow — truly at bottom
             this.bottomReached = true;
             console.log(`[auto-scroll] Bottom of page reached (scrollY=${geoBefore.scrollY}, height=${geoBefore.scrollHeight}). No more content.`);
-          } else if (this.scrollCount > 0 && atDocumentBottom && heightStuck) {
+          } else if (this.scrollCount > 0 && atDocumentBottom && heightStuck && !pageUnscrollable) {
             // At document bottom and no new content loaded
             this.bottomReached = true;
             console.log(`[auto-scroll] At document bottom (scrollY=${geoBefore.scrollY}, height=${geoBefore.scrollHeight}). No infinite scroll detected.`);
+          } else if (pageUnscrollable && this.scrollCount >= this.maxAutoScrolls) {
+            // Page never became scrollable after max attempts — give up
+            this.bottomReached = true;
+            console.log(`[auto-scroll] Page appears unscrollable after ${this.scrollCount} attempts. Handing off to LLM.`);
           } else {
             this.scrollCount++;
             console.log(`[auto-scroll] Semantic check: target NOT visible (${this.scrollCount}/${this.maxAutoScrolls}). Scrolling down...`);
@@ -350,16 +363,26 @@ export class AgentController {
         continue;
       }
 
-      // VERIFY
-      await onStep('VERIFY', `Step ${this.stepCount}: Verifying action result`);
-      const verification = await this.verifier.verify(validatedDecision.action);
-      await onStep('VERIFY', verification.message);
+      // VERIFY — wrapped in try-catch because navigation can destroy execution context
+      let urlAfter = urlBefore;
+      let titleAfter = titleBefore;
+      let textAfter = textBefore;
+      try {
+        await onStep('VERIFY', `Step ${this.stepCount}: Verifying action result`);
+        const verification = await this.verifier.verify(validatedDecision.action);
+        await onStep('VERIFY', verification.message);
 
-      // Wait for page to stabilize after action (navigation or DOM update)
-      await this.domTools.waitForStability();
-      const urlAfter = this.domTools.getUrl();
-      const titleAfter = await this.domTools.getTitle();
-      const textAfter = await this.domTools.getPageTextSnippet(400);
+        // Wait for page to stabilize after action (navigation or DOM update)
+        await this.domTools.waitForStability();
+        urlAfter = this.domTools.getUrl();
+        titleAfter = await this.domTools.getTitle();
+        textAfter = await this.domTools.getPageTextSnippet(400);
+      } catch (navError) {
+        // Execution context destroyed by navigation — this is expected for link clicks.
+        // Treat as a successful state change; the next loop iteration will re-observe.
+        console.log(`[agent] Post-action context destroyed (navigation in progress). Continuing.`);
+        urlAfter = this.domTools.getUrl();
+      }
 
       const stateChanged =
         urlBefore !== urlAfter ||
@@ -407,6 +430,7 @@ export class AgentController {
   }): Promise<Decision> {
     const llmDecision=await this.tryGeminiDecision(sessionId,task, regions, step,feedback);
     if(llmDecision){
+      this.consecutiveFailures = 0; // Valid LLM decision resets failure counter
       console.log('Gemini decision:', llmDecision.action.type, llmDecision.action);
       return llmDecision;
     }
@@ -462,13 +486,59 @@ export class AgentController {
       }
     }
 
-    // Default: done (no action found)
+    // Check if the current step is likely already accomplished
+    // Extract step objective and see if URL/page state matches
+    const stepMatch = task.match(/CURRENT STEP:\s*(.+?)(?:\n|$)/i);
+    const stepObjective = stepMatch ? stepMatch[1].trim().toLowerCase() : '';
+    const currentUrl = this.domTools.getUrl().toLowerCase();
+
+    if (stepObjective) {
+      const alreadyDone =
+        // "navigate to X" but we're already on X
+        (stepObjective.includes('navigate to') && (
+          (stepObjective.includes('youtube') && currentUrl.includes('youtube.com')) ||
+          (stepObjective.includes('linkedin') && currentUrl.includes('linkedin.com')) ||
+          (stepObjective.includes('google') && currentUrl.includes('google.com'))
+        )) ||
+        // "search for X" / "initiate search" but URL already has search results
+        ((stepObjective.includes('search') || stepObjective.includes('initiate')) &&
+          (currentUrl.includes('search') || currentUrl.includes('results') || currentUrl.includes('?q=') || currentUrl.includes('query=')));
+
+      if (alreadyDone) {
+        console.log(`[agent] Step "${stepObjective}" appears already accomplished (URL: ${currentUrl}). Skipping to DONE.`);
+        this.consecutiveFailures = 0;
+        return {
+          action: { type: 'DONE', reason: `Step already accomplished: ${stepObjective}` },
+          reasoning: `The current page URL indicates this step is already done. Advancing to next objective.`,
+          confidence: 0.6,
+        };
+      }
+    }
+
+    // Graduated fallback: scroll → wait → DONE
+    if (this.consecutiveFailures < 1) {
+      this.consecutiveFailures++;
+      return {
+        action: { type: 'SCROLL', direction: 'down', description: 'LLM returned no action. Scrolling to reveal more content.' },
+        reasoning: 'LLM returned no action. Scrolling to reveal more content.',
+        confidence: 0.4,
+      };
+    }
+    if (this.consecutiveFailures < 2) {
+      this.consecutiveFailures++;
+      return {
+        action: { type: 'WAIT', duration: 2000, description: 'Retrying after wait for page to render.' },
+        reasoning: 'Retrying after wait for page to render.',
+        confidence: 0.3,
+      };
+    }
+    this.consecutiveFailures = 0;
     return {
       action: {
         type: 'DONE',
         reason: 'No matching action found for task',
       },
-      reasoning: 'Could not determine appropriate action',
+      reasoning: 'Could not determine appropriate action after retries',
       confidence: 0.3,
     };
   }
@@ -565,10 +635,10 @@ Respond with ONLY the word "YES" or "NO".`.trim();
           `- Step ${h.step_number}: Tried ${h.action_type} on ${h.action_data?.regionId || 'unknown'}. Result: ${h.error ? 'Failed' : 'Executed'}`
         ).join('\n')
       : "(No history yet)";
-    const regionchoices=regions.slice(0,40).map(r=>({id:r.id, label:r.label, ...(r.href ? {href:r.href} : {})}));
+    const regionchoices=regions.slice(0,40).map(r=>({id:r.id, role:r.role, label:r.label, ...(r.href ? {href:r.href} : {})}));
     const url=this.domTools.getUrl();
     const pageText=await this.domTools.getVisibleText();
-    const pageTextSnippet=pageText.slice(0,1500); // Limit to first 1500 chars of visible text
+    const pageTextSnippet=pageText.slice(0,4000); // Increased from 1500 to capture more content on large pages
     const prompt=`
 You are controlling a local browser agent.
 
@@ -725,6 +795,17 @@ DEFINITION OF DONE (Critical):
         return null;
       }
       const parsed=JSON.parse(cleaned);
+
+      // Auto-patch missing optional-ish fields before validation
+      if (parsed.action && typeof parsed.confidence === 'undefined') {
+        parsed.confidence = 0.5;
+        console.log('[agent] Auto-patched missing confidence field with default 0.5');
+      }
+      if (parsed.action && typeof parsed.reasoning === 'undefined') {
+        parsed.reasoning = '(no reasoning provided)';
+        console.log('[agent] Auto-patched missing reasoning field');
+      }
+
       const validated=DecisionSchema.safeParse(parsed);
       if(!validated.success){
         console.warn(`Gemini DecisionSchema validation failed: ${validated.error.message}`);
