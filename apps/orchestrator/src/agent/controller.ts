@@ -15,7 +15,6 @@ export class AgentController {
   private stepCount = 0;
   private maxSteps = 50; // Safety limit
   private lastAction: Action | undefined;
-  private postFillSubmitTries = 0;
   private consecutiveFailures = 0;
   private lastOutcome: {
     stateChanged: boolean;
@@ -26,6 +25,14 @@ export class AgentController {
     textBefore: string;
     textAfter: string;
   } | undefined;
+
+  // Region diff: tracks what elements changed between iterations
+  private previousRegionLabels: string[] = [];
+  private lastRegionDiff: { appeared: string[]; disappeared: string[] } | undefined;
+
+  // Repeated action detection: escape loop when agent is stuck
+  private lastActionKey = '';
+  private repeatedActionCount = 0;
 
   // Auto-scroll state
   private scrollCount = 0;
@@ -53,12 +60,16 @@ export class AgentController {
     task: string,
     onStep: (phase: 'OBSERVE' | 'DECIDE' | 'ACT' | 'VERIFY', message: string, action?: Action) => Promise<void>,
     opts?:{resetStepCount?:boolean}
-  ): Promise<{ completed: boolean; reason: string;pendingAction?: Action ;pauseKind?:'ASK_USER'|'CONFIRM' }> {
+  ): Promise<{ completed: boolean; reason: string;pendingAction?: Action ;pauseKind?:'ASK_USER'|'CONFIRM'; stepCompletionCheck?: boolean }> {
     const reset = opts?.resetStepCount ?? true;
     if (reset) {
       this.stepCount = 0;
       this.lastAction = undefined;
       this.lastOutcome = undefined;
+      this.previousRegionLabels = [];
+      this.lastRegionDiff = undefined;
+      this.lastActionKey = '';
+      this.repeatedActionCount = 0;
       this.scrollCount = 0;
       this.contentVisible = false;
       this.bottomReached = false;
@@ -71,28 +82,32 @@ export class AgentController {
     while (this.stepCount < this.maxSteps) {
       this.stepCount++;
 
-      // ====== FAST AUTO-RECOVERY: skip expensive re-scan after fill ======
-      // After a fill with no state change, the first recovery is always Enter.
-      // Enter doesn't need regions, so skip the full scan to save 30-90s on heavy pages.
-      // 2nd recovery (find Submit button) still needs regions → do full scan then.
-      const lastWasFill =
-        this.lastAction?.type === 'VISION_FILL' || this.lastAction?.type === 'DOM_FILL';
-      const needsFillRecovery = lastWasFill && this.lastOutcome && this.lastOutcome.stateChanged === false;
-      const canSkipScan = needsFillRecovery && this.postFillSubmitTries === 0;
+      // OBSERVE
+      await onStep('OBSERVE', `Step ${this.stepCount}: Observing page state`);
+      const regions = await this.regionizer.detectRegions();
+      const observation = await this.observe(regions);
+      await onStep('OBSERVE', observation);
 
-      let regions: Region[];
-
-      if (canSkipScan) {
-        // First recovery attempt: just pressing Enter — no scan needed
-        await onStep('OBSERVE', `Step ${this.stepCount}: Fill detected, pressing Enter`);
-        regions = [];
+      // ====== REGION DIFF: detect what elements appeared/disappeared since last action ======
+      const currentLabels = regions.map(r => r.label).filter(Boolean) as string[];
+      if (this.previousRegionLabels.length > 0 && this.lastAction) {
+        const prevSet = new Set(this.previousRegionLabels);
+        const currSet = new Set(currentLabels);
+        const appeared = currentLabels.filter(l => !prevSet.has(l));
+        const disappeared = this.previousRegionLabels.filter(l => !currSet.has(l));
+        if (appeared.length > 0 || disappeared.length > 0) {
+          this.lastRegionDiff = {
+            appeared: appeared.slice(0, 15),
+            disappeared: disappeared.slice(0, 15),
+          };
+          console.log(`[region-diff] +${appeared.length} new, -${disappeared.length} gone`);
+        } else {
+          this.lastRegionDiff = undefined;
+        }
       } else {
-        // Full OBSERVE for everything else
-        await onStep('OBSERVE', `Step ${this.stepCount}: Observing page state`);
-        regions = await this.regionizer.detectRegions();
-        const observation = await this.observe(regions);
-        await onStep('OBSERVE', observation);
+        this.lastRegionDiff = undefined;
       }
+      this.previousRegionLabels = currentLabels;
 
       // ====== URL CHANGE DETECTION: reset scroll state on navigation ======
       const currentUrl = this.domTools.getUrl();
@@ -108,124 +123,7 @@ export class AgentController {
         this.consecutiveFailures = 0;
         this.lastUrl = currentUrl;
       }
-
-      // ====== AUTO-RECOVERY: submit after fill if no state change ======
-      if (needsFillRecovery) {
-        let injectedAction: Action;
-
-        // 1st try: press Enter
-        if (this.postFillSubmitTries === 0) {
-          const targetRegionId=(this.lastAction as any).regionId;
-          injectedAction = {
-            type: 'KEY_PRESS',
-            key: 'Enter',
-            regionId:targetRegionId,
-            description: 'Auto-submit after fill (Enter)',
-          };
-        }
-        // 2nd try: click a likely Search/Submit button, else Enter again
-        else if (this.postFillSubmitTries === 1) {
-          const keywords = ['search', 'submit', 'go', 'find'];
-
-          const candidate = regions.find(r => {
-            const label = (r.label || '').toLowerCase();
-            const clickable =
-              r.id.startsWith('button-') ||
-              r.id.startsWith('link-') ||
-              r.id.startsWith('role-');
-            return clickable && keywords.some(k => label.includes(k));
-          });
-
-          injectedAction = candidate
-            ? {
-                type: 'VISION_CLICK',
-                regionId: candidate.id,
-                description: `Auto-submit after fill (click "${candidate.label}")`,
-              }
-            : {
-                type: 'KEY_PRESS',
-                key: 'Enter',
-                description: 'Auto-submit after fill (Enter fallback)',
-              };
-        }
-        // 3rd+ try: ask user
-        else {
-          await onStep(
-            'DECIDE',
-            'Submission did not trigger after filling. Asking user to submit manually.'
-          );
-          return {
-            completed: false,
-            reason:
-              'I filled the field but submission didn’t trigger. Please press Enter or click Search/Submit in the browser, then click Continue.',
-            pauseKind: 'ASK_USER',
-          };
-        }
-
-        await onStep(
-          'DECIDE',
-          `No state change after fill. Auto-recovery attempt ${this.postFillSubmitTries + 1}: ${injectedAction.type}`,
-          injectedAction
-        );
-
-        const urlBefore = this.domTools.getUrl();
-        const titleBefore = await this.domTools.getTitle();
-        const textBefore = await this.domTools.getPageTextSnippet(400);
-
-        try {
-          await this.act(injectedAction);
-          await onStep('ACT', `Executed auto-recovery: ${injectedAction.type}`, injectedAction);
-        } catch (error) {
-          await onStep(
-            'ACT',
-            `Auto-recovery failed: ${error instanceof Error ? error.message : String(error)}`
-          );
-
-          this.postFillSubmitTries++;
-
-          this.lastAction = injectedAction;
-          this.lastOutcome = {
-            stateChanged: false,
-            urlBefore,
-            urlAfter: urlBefore,
-            titleBefore,
-            titleAfter: titleBefore,
-            textBefore,
-            textAfter: textBefore,
-          };
-          continue;
-        }
-
-        await this.domTools.waitForStability();
-
-        const urlAfter = this.domTools.getUrl();
-        const titleAfter = await this.domTools.getTitle();
-        const textAfter = await this.domTools.getPageTextSnippet(400);
-
-        const stateChanged =
-          urlBefore !== urlAfter ||
-          titleBefore !== titleAfter ||
-          textBefore !== textAfter;
-
-        this.lastAction = injectedAction;
-        this.lastOutcome = {
-          stateChanged,
-          urlBefore,
-          urlAfter,
-          titleBefore,
-          titleAfter,
-          textBefore,
-          textAfter,
-        };
-
-        if (stateChanged) this.postFillSubmitTries = 0;
-        else this.postFillSubmitTries++;
-
-        // Skip normal DECIDE this loop iteration
-        continue;
-      }
-      // ====== END AUTO-RECOVERY ======
-
+      
       // ====== AUTO-SCROLL: semantic content-aware scrolling ======
       if (!this.contentVisible && this.scrollCount < this.maxAutoScrolls && !this.bottomReached) {
         const visibleText = await this.domTools.getVisibleText();
@@ -311,6 +209,7 @@ export class AgentController {
       const decision = await this.decide(sessionId,task, regions, this.stepCount, {
         lastAction: this.lastAction,
         lastOutcome: this.lastOutcome,
+        regionDiff: this.lastRegionDiff,
       });
 
       const parsed= DecisionSchema.safeParse(decision);
@@ -335,6 +234,32 @@ export class AgentController {
         return { completed: false, reason: validatedDecision.action.message, pauseKind:'ASK_USER' };
       }
 
+      // ====== REPEATED ACTION DETECTION: escape stuck loops ======
+      // Use element label (not regionId) as key since regionIds are regenerated each scan
+      const targetRegionId = (validatedDecision.action as any).regionId;
+      const targetLabel = targetRegionId ? regions.find(r => r.id === targetRegionId)?.label : '';
+      const actionKey = `${validatedDecision.action.type}:${targetLabel || ''}`;
+      if (actionKey === this.lastActionKey) {
+        this.repeatedActionCount++;
+      } else {
+        this.repeatedActionCount = 0;
+        this.lastActionKey = actionKey;
+      }
+      if (this.repeatedActionCount >= 2) {
+        // 3rd attempt at the same action — ask user if step is done
+        const attempts = this.repeatedActionCount + 1;
+        console.log(`[stuck-detection] Same action "${actionKey}" attempted ${attempts} times. Asking user.`);
+        this.repeatedActionCount = 0;
+        this.lastActionKey = '';
+        const msg = `I've attempted the same action (${validatedDecision.action.type}) ${attempts} times without visible change. Is this step already complete?`;
+        await onStep('DECIDE', msg);
+        return {
+          completed: false,
+          reason: msg,
+          pauseKind: 'CONFIRM',
+          stepCompletionCheck: true,
+        };
+      }
 
       // Check guardrails
       const guardrailCheck = await this.guardrails.checkAction(validatedDecision.action, regions);
@@ -441,6 +366,7 @@ export class AgentController {
       textBefore: string;
       textAfter: string;
     };
+    regionDiff?: { appeared: string[]; disappeared: string[] };
   }): Promise<Decision> {
     const llmDecision=await this.tryGeminiDecision(sessionId,task, regions, step,feedback);
     if(llmDecision){
@@ -599,6 +525,7 @@ Respond with ONLY the word "YES" or "NO".`.trim();
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
           generationConfig: { temperature: 0, maxOutputTokens: 8 },
         }),
+        signal: AbortSignal.timeout(10_000),
       });
 
       if (!res.ok) {
@@ -638,6 +565,7 @@ Respond with ONLY the word "YES" or "NO".`.trim();
       textBefore: string;
       textAfter: string;
     };
+    regionDiff?: { appeared: string[]; disappeared: string[] };
   }): Promise<Decision | null> {
     const apiKey=config.llm?.geminiApiKey;
     if (!apiKey){ 
@@ -652,14 +580,14 @@ Respond with ONLY the word "YES" or "NO".`.trim();
     // Smart region selection: prioritize content links (with href) over navigation chrome.
     // On YouTube search results, the first 40 DOM elements are all header/nav — video links get cut off.
     const contentRegions = regions.filter(r => r.href && r.role === 'link');
-    const inputRegions = regions.filter(r => r.role === 'input' || r.role === 'textarea');
-    const otherRegions = regions.filter(r => !(r.href && r.role === 'link') && r.role !== 'input' && r.role !== 'textarea');
+    const inputRegions = regions.filter(r => r.role === 'input' || r.role === 'textarea' || r.role === 'select');
+    const otherRegions = regions.filter(r => !(r.href && r.role === 'link') && r.role !== 'input' && r.role !== 'textarea' && r.role !== 'select');
     // Compose: all inputs first (fill targets), then content links (click targets), then the rest
     const prioritized = [...inputRegions, ...contentRegions, ...otherRegions];
     const regionchoices = prioritized.slice(0, 60).map(r => ({id: r.id, role: r.role, label: r.label, ...(r.href ? {href: r.href} : {})}));
     const url=this.domTools.getUrl();
     const pageText=await this.domTools.getVisibleText();
-    const pageTextSnippet=pageText.slice(0,4000); // Increased from 1500 to capture more content on large pages
+    const pageTextSnippet=pageText.slice(0,2000);
     const prompt=`
 You are controlling a local browser agent.
 
@@ -690,6 +618,7 @@ ${JSON.stringify(
           titleBefore: feedback.lastOutcome.titleBefore,
           titleAfter: feedback.lastOutcome.titleAfter,
         },
+        ...(feedback.regionDiff ? { contentDiff: feedback.regionDiff } : {}),
       }
     : { lastAction: feedback?.lastAction, lastOutcome: undefined },
   null,
@@ -700,79 +629,27 @@ SCROLL STATUS:
 Auto-scrolled ${this.scrollCount} time(s) on this page. Target content is ${this.contentVisible ? 'VISIBLE' : 'NOT YET VISIBLE'}.${this.bottomReached ? '\nBottom of page reached — no more content below.' : ''}${this.scrollCount >= this.maxAutoScrolls ? '\nMax auto-scrolls reached.' : ''}
 
 INTERACTIVE REGIONS (choose by id):
-${JSON.stringify(regionchoices, null, 2)}
+${JSON.stringify(regionchoices)}
 
-BEFORE choosing an action, you MUST perform a SITUATION ANALYSIS in your reasoning:
+Respond with ONLY valid JSON: { "action": {...}, "reasoning": "1-2 sentences", "confidence": 0-1.0 }
 
-1. **WHERE AM I?** — Look at the CURRENT URL and PAGE TEXT. What kind of page is this? (search results, a profile page, an article, a homepage, a settings page, etc.)
+Actions (use regionId from INTERACTIVE REGIONS):
+- DOM_CLICK: { "type": "DOM_CLICK", "regionId": "element-xxx" }
+- DOM_FILL: { "type": "DOM_FILL", "regionId": "element-xxx", "value": "text from TASK" }
+- KEY_PRESS: { "type": "KEY_PRESS", "key": "Enter", "regionId"?: "element-xxx" }
+- SCROLL: { "type": "SCROLL", "direction": "up"|"down" }
+- ASK_USER: { "type": "ASK_USER", "message": "what you need" }
+- DONE: { "type": "DONE", "reason": "what was accomplished" }
 
-2. **HOW DID I GET HERE?** — Look at SHORT-TERM MEMORY. What actions brought me to this page? If I navigated to a specific profile/page to find content, I should stay here and explore it.
-
-3. **DOES THE STEP MAKE SENSE HERE?** — Read the CURRENT STEP literally vs. what this page actually offers:
-   - If the step says "Search for X" but I'm already on a specific profile/page that likely contains X → **SCROLL to find it** instead of using a global search bar (which would navigate AWAY from this page I spent effort reaching).
-   - If the step says "Find X" and I'm on a content page → SCROLL first, don't search.
-   - If I'm on a search engine or homepage → then using a search bar makes sense.
-   - **KEY QUESTION**: "Would clicking this element LEAVE the page I worked hard to reach?" If yes, think twice.
-
-Your "reasoning" field MUST include this analysis (1-2 sentences). Then choose the action.
-
-You MUST respond with ONLY valid JSON (no backticks, no extra text) matching this TypeScript shape:
-
-{
-  "action": { "type": "...", ... },
-  "reasoning": string,
-  "confidence": 0-1.0
-}
-INTELLIGENT RULES (READ CAREFULLY):
-1. **CHECK IF DONE FIRST**: Before choosing an action, check if the "Current Step" is ALREADY accomplished.
-   - **Google Images**: If the URL contains "udm=2" or "tbm=isch", you are ALREADY on the Images tab. DO NOT click "Images" again. Return "DONE".
-   - **Tabs**: If the button for the target tab is disabled or highlighted, you are likely already there.
-   
-2. **SELF-CORRECTION**: 
-   - Look at your HISTORY. Did you just try to "Click Images" and the URL is now different? If yes, assume it worked and move on.
-   - If an action failed (Timeout/Not Enabled), it means the element is not interactive (likely because it's the active tab). Stop clicking it.
-
-3. **USE THE ID**: Always pick the element ID (e.g., "element-123") from the list below.
-
-Allowed action types:
-1. **VISION_CLICK** / **DOM_CLICK**:
-   - MUST include "regionId".
-   - Example: { "type": "VISION_CLICK", "regionId": "element-123" }
-
-2. **VISION_FILL** / **DOM_FILL**:
-   - MUST include "regionId" AND "value".
-   - The "value" MUST come from the TASK, CURRENT STEP, or GUIDANCE text. NEVER invent or guess fill values.
-   - Example: { "type": "VISION_FILL", "regionId": "element-123", "value": "exact text from task" }
-3. WAIT: { "type":"WAIT", "duration"?: number, "until"?: string, "description"?: string }
-4. ASK_USER: { "type":"ASK_USER", "message": string, "actionId"?: string }
-5. CONFIRM: { "type":"CONFIRM", "message": string, "actionId"?: string }
-6. DONE: { "type":"DONE", "reason"?: string }
-7. **SCROLL**: { "type":"SCROLL", "direction": "up" | "down", "amount"?: number, "description"?: string }
-   - Scrolls the page. Default amount is 600px (~one viewport).
-   - **NOTE**: The system has an auto-scroll feature that scrolls BEFORE you are called. Check the SCROLL STATUS section above.
-   - If SCROLL STATUS says "Target content is VISIBLE", the content you need is already on screen — work with it.
-   - If SCROLL STATUS says "Bottom of page reached", there is no more content below — do NOT scroll down further.
-   - Only use SCROLL manually if you need to scroll UP, or if you need to see specific content the auto-scroll missed.
-
-8. KEY_PRESS: { "type":"KEY_PRESS", "key": string, "regionId"?: string, "description"?: string }
-
-IMPORTANT:
-- **FILL VALUES**: Only use text that is explicitly stated in the TASK or CURRENT STEP. If the step says "Search for OpenAI demos", the fill value is "OpenAI demos". If the step does NOT mention what to type, do NOT fill anything — return ASK_USER instead.
-- The initial page starts as unsigned-in. So if the task involves personal data, accounts, or payments..etc you must first sign in.
-- If this page requires credentials, login, payment, or MFA, return ASK_USER with a clear message telling the human what to do, and do NOT attempt to fill passwords.
-- If you are unsure, return ASK_USER instead of guessing.
-- Never repeat the exact same action if lastOutcome.stateChanged is false.
-- For example, If you filled an input and stateChanged is false, try a different strategy (e.g. KEY_PRESS "Enter" or click a search/submit button) instead of filling again.
-- Never use null. If a field is not needed, omit it entirely.
-- If no button exists, use KEY_PRESS "Enter" with the 'regionId' of the input field you just filled.
-- Review "SHORT-TERM MEMORY". If you see you just performed an action (like clicking a tab) and the URL hasn't changed, DO NOT repeat it. Try a different strategy (e.g. DOM_CLICK instead of VISION, or KEY_PRESS).
-- **STAY ON TASK**: Only perform actions described in the CURRENT STEP. Do not jump ahead to future steps in the plan.
-
-DEFINITION OF DONE (Critical):
-- You are NOT done until you have extracted the ACTUAL CONTENT requested by the task.
-- A list of Google search results is NOT the answer. You must click into relevant pages and read the content.
-- If the task asks to "find", "research", "compare", or "recommend" something, you MUST visit multiple sources and read their content before returning DONE.
-- Only return DONE when you have gathered enough information to synthesize a real answer.
+Rules:
+- Fill values MUST come from the TASK or CURRENT STEP. Never guess.
+- For credentials/login/payment, return ASK_USER. Never fill passwords.
+- If contentDiff shows new elements appeared, your last action SUCCEEDED. Do NOT repeat it — move to the next logical action or return DONE if the step is complete.
+- If lastOutcome.stateChanged is true, your last action changed the page. Don't repeat it.
+- If lastOutcome.stateChanged is false AND contentDiff is empty, try a different approach (e.g. click a submit button, press Enter, or use DOM_CLICK instead).
+- Check if the current step is already done before acting. Look at the page text and interactive regions.
+- Stay on the current step. Don't jump ahead.
+- For research tasks, visit multiple sources and read content before DONE.
 `.trim();
     try {
       const model='gemini-3-flash-preview';
@@ -788,6 +665,7 @@ DEFINITION OF DONE (Critical):
             temperature:0.2,
           },
         }),
+        signal: AbortSignal.timeout(30_000),
       });
       if(!res.ok){
         const text=await res.text();

@@ -89,14 +89,15 @@ export const PlanSchema = z.object({
   // 2. Whether the task requires a final synthesis/answer for the user
   needsSynthesis: z.boolean().default(false).describe("True if the user expects information back (research, questions, 'tell me', 'find out', 'how many'). False for pure navigation/action tasks."),
 
-  // 3. The Steps: Rich objects instead of just strings
+  // 3. Single starting URL from scout (navigate here once before the plan runs)
+  startUrl: z.string().optional().describe("The single best verified URL to start from (from scout search results). Agent navigates here once before executing steps."),
+
+  // 4. The Steps: Rich objects instead of just strings
   steps: z.array(z.object({
     id: z.number(),
     title: z.string().describe("Short objective (e.g. 'Search for chatgpt')"),
     description: z.string().describe("Detailed guidance on what to look for (e.g. 'Find the search bar at the top center')."),
     needsAuth: z.boolean().describe("True if this step involves login/MFA."),
-    // NEW: Optional verified URL from Pre-Planning Scout
-    targetUrl: z.string().optional().describe("Verified URL to navigate to (from scout search results). Only include if a specific URL was verified."),
   })).max(15)
 });
 

@@ -29,7 +29,7 @@ export class DOMTools {
 
     // 2. Find all interactive elements (buttons, links, inputs)
     // We use a broad selector to get them in visual order
-    const selector = 'button, [role="button"], a[href], input:not([type="hidden"]), textarea, select, [role="link"], [role="checkbox"], [role="radio"]';
+    const selector = 'button, [role="button"], a[href], input:not([type="hidden"]), textarea, select, [role="link"], [role="checkbox"], [role="radio"], [role="combobox"], [role="searchbox"], [contenteditable="true"]';
     const elements = await this.page.locator(selector).all();
 
     // 3. Loop through and "Tag" them
@@ -38,7 +38,32 @@ export class DOMTools {
       if (!await element.isVisible()) continue;
 
       let bbox = await element.boundingBox();
-      if (!bbox || bbox.width < 5 || bbox.height < 5) continue;
+      if (!bbox || bbox.width < 5 || bbox.height < 5) {
+        // Widget inputs (Select2, React Select, MUI, etc.) wrap a tiny <input>
+        // inside a styled container. The input is real and fillable, but visually
+        // tiny. Bubble up to find the container's bbox so the agent can see it.
+        const tag = await element.evaluate(el => el.tagName.toLowerCase());
+        if (tag === 'input' || tag === 'textarea') {
+          const parentBbox = await element.evaluate(el => {
+            let node = el.parentElement;
+            for (let i = 0; i < 5 && node; i++) {
+              const rect = node.getBoundingClientRect();
+              if (rect.width >= 20 && rect.height >= 10) {
+                return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+              }
+              node = node.parentElement;
+            }
+            return null;
+          });
+          if (parentBbox) {
+            bbox = parentBbox;
+          } else {
+            continue;
+          }
+        } else {
+          continue;
+        }
+      }
 
       // 3a. Bubble-up: if this is an inert child (img, div, span), find parent <a> or <button>
       let target = element;
@@ -249,9 +274,16 @@ export class DOMTools {
     if (!element) {
       throw new Error(`Stale Element: Region ${regionId} not found.`);
     }
-    
+
     await element.scrollIntoViewIfNeeded();
-    await element.fill(value);
+
+    // <select> elements need selectOption(), not fill()
+    const tag = await element.evaluate(el => el.tagName.toLowerCase());
+    if (tag === 'select') {
+      await element.selectOption({ label: value });
+    } else {
+      await element.fill(value);
+    }
   }
 
   async pressKey(key: string): Promise<void> {

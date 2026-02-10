@@ -41,7 +41,9 @@ class Orchestrator {
     pausedForHumanObjective?: string;
     strategy:string;
     needsSynthesis: boolean;
+    startUrl?: string;
     researchNotes: string[];
+    stepCompletionCheck?: boolean;
 
   }> = new Map();
 
@@ -96,6 +98,34 @@ class Orchestrator {
 
             // If user rejected confirmation
             if (!confirmation.approved) {
+              // Step-completion check rejected = "not done yet, keep trying"
+              if (session.stepCompletionCheck) {
+                session.stepCompletionCheck = false;
+                session.paused = false;
+                session.pendingAction = undefined;
+                session.resume = true;
+
+                this.sendMessage(session.wsClient, {
+                  type: 'log',
+                  data: {
+                    step: session.stepCount,
+                    phase: 'ACT',
+                    message: 'User says step not complete. Resuming agent...',
+                    timestamp: new Date().toISOString(),
+                  },
+                });
+
+                this.runAgentLoop(sessionId).catch((error) => {
+                  console.error(`Agent loop error for session ${sessionId}:`, error);
+                  this.sendMessage(session.wsClient, {
+                    type: 'error',
+                    data: { message: error instanceof Error ? error.message : String(error) },
+                  });
+                  this.db.updateSessionStatus(sessionId, 'error');
+                });
+                return;
+              }
+
               session.paused = false;
               session.pendingAction = undefined;
 
@@ -121,6 +151,24 @@ class Orchestrator {
             session.pendingAction = undefined;
             session.paused = false;
 
+            // Step-completion check: user confirmed the step is done — advance planIndex
+            if (session.stepCompletionCheck) {
+              const stepData = session.plan[session.planIndex];
+              const stepTitle = stepData?.title || 'Unknown step';
+              session.completedSteps.push(stepTitle);
+              session.planIndex++;
+              session.stepCompletionCheck = false;
+
+              this.sendMessage(session.wsClient, {
+                type: 'status',
+                data: {
+                  sessionId,
+                  status: 'running',
+                  message: `Step confirmed complete by user: ${stepTitle}`,
+                },
+              });
+            }
+
             // Optional: log to UI that we're executing the confirmed action
             this.sendMessage(session.wsClient, {
               type: 'log',
@@ -128,7 +176,7 @@ class Orchestrator {
                 step: session.stepCount,
                 phase: 'ACT',
                 message: action
-                ?'User approved. Executing confirmed action.': 'User approved. Resuming after manual confirmation.',
+                ?'User approved. Executing confirmed action.': 'User approved. Resuming.',
                 timestamp: new Date().toISOString(),
               },
             });
@@ -263,6 +311,7 @@ class Orchestrator {
       plan:planResult.steps,
       strategy: planResult.strategy,
       needsSynthesis: planResult.needsSynthesis,
+      startUrl: planResult.startUrl,
       planIndex:0,
       completedSteps:[],
       pausedForHumanObjective: undefined,
@@ -293,6 +342,10 @@ class Orchestrator {
     }
     const { regionizer, screenshotManager, wsClient, agent, task, browser } = session;
 
+    // Capture resume state BEFORE anything modifies it.
+    // Used for: smart fast-forward, scout URL skip, agent resetStepCount.
+    const isResuming = Boolean(session.resume);
+
     // ===== UNIVERSAL HUMAN-OWNED OBJECTIVE ENFORCEMENT =====
     // If we are resuming from a human-owned objective, mark it complete and advance.
     if (session.resume && session.pausedForHumanObjective) {
@@ -311,6 +364,11 @@ class Orchestrator {
           message: `Objective completed (human): ${doneObj}`,
         },
       });
+    }
+
+    // ===== SMART FAST-FORWARD: After any resume, skip past already-completed steps =====
+    if (isResuming) {
+      await this.smartFastForward(sessionId);
     }
 
     // Recompute after possible advance
@@ -364,8 +422,27 @@ class Orchestrator {
     });
 
 
-    // Run agent loop
-        // Run objectives sequentially until pause or completion
+    // ===== ONE-TIME PRE-NAVIGATION: If plan has a startUrl, navigate there now =====
+    // Skip on resume — agent is already past the starting page.
+    if (session.startUrl && !isResuming) {
+      this.sendMessage(wsClient, {
+        type: 'log',
+        data: {
+          step: session.stepCount,
+          phase: 'NAVIGATE',
+          message: `[Scout] Navigating to verified start URL: ${session.startUrl}`,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      try {
+        await session.browser.navigate(session.startUrl);
+        await session.domTools.waitForStability();
+      } catch (navError) {
+        console.warn(`[Scout] Start URL navigation failed: ${navError}`);
+      }
+    }
+
+    // Run agent loop — objectives sequentially until pause or completion
     while (session.planIndex < session.plan.length) {
       try {
         const allPages = session.browser.getAllPages(); // Use the public method we added
@@ -390,27 +467,6 @@ class Orchestrator {
       }
       const stepData = session.plan[session.planIndex];
 
-      // ===== PRE-NAVIGATION: If step has a verified targetUrl, navigate directly =====
-      if (stepData.targetUrl) {
-        this.sendMessage(wsClient, {
-          type: 'log',
-          data: {
-            step: session.stepCount,
-            phase: 'NAVIGATE',
-            message: `[Scout] Navigating directly to verified URL: ${stepData.targetUrl}`,
-            timestamp: new Date().toISOString(),
-          },
-        });
-
-        try {
-          await session.browser.navigate(stepData.targetUrl);
-          await session.domTools.waitForStability();
-        } catch (navError) {
-          console.warn(`[Scout] Direct navigation failed: ${navError}`);
-          // Continue anyway, agent will handle it
-        }
-      }
-
       const notesContext = session.researchNotes.length > 0
         ? `\nRESEARCH NOTES SO FAR:\n${session.researchNotes.join('\n---\n').slice(-3000)}`
         : '';
@@ -421,10 +477,9 @@ class Orchestrator {
   STRATEGY: ${session.strategy}
   CURRENT STEP: ${stepData.title}
   GUIDANCE: ${stepData.description}
-  ${stepData.targetUrl ? `TARGET URL: ${stepData.targetUrl} (You should already be on this page)` : ''}
 
   FULL PLAN:
-  ${session.plan.map(s => `[${s.id}] ${s.title}${s.targetUrl ? ` → ${s.targetUrl}` : ''}`).join('\n')}
+  ${session.plan.map(s => `[${s.id}] ${s.title}`).join('\n')}
   ${notesContext}
         `.trim();
 
@@ -455,8 +510,12 @@ class Orchestrator {
           });
 
           if (phase === 'ACT' && action) {
-            // Wait for page stability instead of arbitrary sleep
-            await session.domTools.waitForStability();
+            // Only wait for stability on actions that can trigger navigation.
+            // Scrolls, fills, and selects don't navigate — waiting just burns 3-4.5s on timeouts.
+            const mayNavigate = ['DOM_CLICK', 'VISION_CLICK', 'KEY_PRESS', 'NAVIGATE'].includes(action.type);
+            if (mayNavigate) {
+              await session.domTools.waitForStability();
+            }
             const screenshotBuffer = await session.screenshotManager.capture();
             const screenshotPath = this.traceManager.saveScreenshot(sessionId, stepNumber, screenshotBuffer);
 
@@ -476,7 +535,7 @@ class Orchestrator {
             });
           }
         },
-        { resetStepCount: !session.resume }
+        { resetStepCount: !isResuming }
       );
 
       session.resume = false;
@@ -510,7 +569,7 @@ class Orchestrator {
         const currentUrl = session.domTools.getUrl();
         while (session.planIndex < session.plan.length) {
           const nextStep = session.plan[session.planIndex];
-          if (this.isStepLikelyDone(nextStep.title, currentUrl, nextStep.targetUrl)) {
+          if (this.isStepLikelyDone(nextStep.title, currentUrl)) {
             console.log(`[fast-forward] Skipping "${nextStep.title}" — already accomplished (URL: ${currentUrl})`);
             session.completedSteps.push(nextStep.title);
             session.planIndex++;
@@ -537,6 +596,7 @@ class Orchestrator {
         session.paused = true;
         session.resume = true;
         session.pendingAction = result.pendingAction;
+        session.stepCompletionCheck = result.stepCompletionCheck ?? false;
         this.db.updateSessionStatus(sessionId, 'paused');
 
         this.sendMessage(wsClient, {
@@ -609,26 +669,95 @@ class Orchestrator {
   }
 
   /**
+   * Smart fast-forward: after a resume, use a cheap LLM call to detect
+   * which plan steps are already accomplished by the current page state.
+   * Advances planIndex past completed steps so the agent doesn't repeat work.
+   */
+  private async smartFastForward(sessionId: string): Promise<void> {
+    const session = this.activeSessions.get(sessionId);
+    if (!session || session.planIndex >= session.plan.length) return;
+
+    const apiKey = config.llm?.geminiApiKey;
+    if (!apiKey) return;
+
+    const currentUrl = session.domTools.getUrl();
+    let pageTitle = '';
+    try { pageTitle = await session.domTools.getTitle(); } catch {}
+
+    const remainingSteps = session.plan.slice(session.planIndex);
+    if (remainingSteps.length === 0) return;
+
+    const stepList = remainingSteps
+      .map((s, i) => `${session.planIndex + i}. ${s.title}`)
+      .join('\n');
+
+    const prompt = `Browser state:
+URL: ${currentUrl}
+Title: ${pageTitle}
+
+Plan steps (starting from current):
+${stepList}
+
+How many of these steps IN ORDER from the top are ALREADY COMPLETED based on the URL and title?
+- "Navigate to X" is done if the URL contains the site name.
+- "Log in" / "SSO" is done if the URL is NOT on a login/SSO page.
+- "Select term" is done if the URL contains a term parameter.
+- Count only consecutive steps from the top. Stop at the first incomplete one.
+
+Return ONLY a single number (0 if none are done).`;
+
+    try {
+      const model = 'gemini-2.5-flash';
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 8 },
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (!res.ok) return;
+
+      const json = (await res.json()) as any;
+      const text: string | undefined = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) return;
+
+      const count = parseInt(text.trim(), 10);
+      if (isNaN(count) || count <= 0) return;
+
+      const toSkip = Math.min(count, remainingSteps.length);
+      for (let i = 0; i < toSkip; i++) {
+        const step = session.plan[session.planIndex];
+        console.log(`[smart-fast-forward] Skipping step "${step.title}" — already accomplished`);
+        session.completedSteps.push(step.title);
+        session.planIndex++;
+
+        this.sendMessage(session.wsClient, {
+          type: 'status',
+          data: {
+            sessionId,
+            status: 'running',
+            message: `Step auto-skipped (already done): ${step.title}`,
+          },
+        });
+      }
+
+      console.log(`[smart-fast-forward] Skipped ${toSkip} steps. Now on planIndex=${session.planIndex}`);
+    } catch (err) {
+      console.warn('[smart-fast-forward] Failed:', err);
+    }
+  }
+
+  /**
    * Check if a plan step is already accomplished by the current page state.
    * Used to fast-forward past steps the agent completed ahead of schedule.
    */
-  private isStepLikelyDone(stepTitle: string, currentUrl: string, targetUrl?: string): boolean {
+  private isStepLikelyDone(stepTitle: string, currentUrl: string): boolean {
     const title = stepTitle.toLowerCase();
     const url = currentUrl.toLowerCase();
-
-    // If step has a targetUrl and we're already past it (on a deeper page), skip
-    if (targetUrl) {
-      try {
-        const targetHost = new URL(targetUrl).hostname;
-        if (url.includes(targetHost)) {
-          // We're on the same site — if URL is deeper or has query params, step is done
-          if (url.includes('search') || url.includes('results') || url.includes('watch') ||
-              url.includes('/in/') || url.includes('/p/') || url.length > targetUrl.length + 20) {
-            return true;
-          }
-        }
-      } catch {}
-    }
 
     // "Navigate to X" — check if we're on that site
     if (title.includes('navigate')) {

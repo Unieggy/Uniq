@@ -308,8 +308,8 @@ async function performScout(query: string, wsClient?: WebSocket): Promise<Search
 
         output.push({ title, url: href, snippet });
 
-        // Stop after 3 good results
-        if (output.length >= 3) break;
+        // Grab up to 5 candidates — LLM will pick the best one
+        if (output.length >= 5) break;
       }
 
       return output;
@@ -321,7 +321,7 @@ async function performScout(query: string, wsClient?: WebSocket): Promise<Search
     await browser.close();
 
     if (results.length > 0) {
-      const successMsg = `✓ Found ${results.length} URLs:\n${results.map((r, i) => `  [${i + 1}] ${r.title}\n      ${r.url}`).join('\n')}`;
+      const successMsg = `✓ Found ${results.length} candidate(s):\n${results.map((r, i) => `  [${i + 1}] ${r.title} → ${r.url}`).join('\n')}`;
       console.log(`[Scout] ${successMsg}`);
       sendScoutLog(wsClient, successMsg);
       return results;
@@ -345,25 +345,70 @@ async function performScout(query: string, wsClient?: WebSocket): Promise<Search
 /**
  * Format scout results for injection into the planner prompt.
  */
-function formatScoutContext(scoutContext: ScoutContext | null): string {
-  if (!scoutContext || scoutContext.results.length === 0) {
-    return '';
-  }
-
-  const resultsText = scoutContext.results
-    .map((r, i) => `[${i + 1}] "${r.title}" → ${r.url}${r.snippet ? ` (${r.snippet.slice(0, 100)}...)` : ''}`)
-    .join('\n');
+function formatScoutContext(scoutUrl: string | null): string {
+  if (!scoutUrl) return '';
 
   return `
-### VERIFIED CONTEXT FROM GOOGLE SEARCH
-I searched for: "${scoutContext.query}"
+### VERIFIED START URL (from Google search)
+URL: ${scoutUrl}
 
-TOP RESULTS:
-${resultsText}
-
-**CRITICAL**: Use the URLs from these search results. DO NOT invent or guess URLs.
-If the task involves one of these sites, use the EXACT URL provided above.
+The agent will navigate to this URL before executing steps. Do NOT include a "navigate to" step for this URL.
 `;
+}
+
+/**
+ * Use a cheap LLM call to pick the single best URL from scout candidates.
+ * Returns the chosen URL, or the first result as fallback.
+ */
+async function pickBestUrl(task: string, results: SearchResult[]): Promise<string> {
+  if (results.length === 1) return results[0].url;
+
+  const apiKey = config.llm?.geminiApiKey;
+  if (!apiKey) return results[0].url;
+
+  const candidates = results
+    .map((r, i) => `${i + 1}. "${r.title}" → ${r.url}${r.snippet ? ` — ${r.snippet.slice(0, 80)}` : ''}`)
+    .join('\n');
+
+  const prompt = `User task: "${task}"
+
+Google search returned these URLs:
+${candidates}
+
+Which ONE URL is the best starting point for this task? Pick the most direct, official page (prefer .edu, official portals, login pages over info/blog pages).
+
+Return ONLY the number (1-${results.length}).`;
+
+  try {
+    const model = 'gemini-2.5-flash';
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0, maxOutputTokens: 8 },
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!res.ok) return results[0].url;
+
+    const json = (await res.json()) as any;
+    const text: string | undefined = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) return results[0].url;
+
+    const idx = parseInt(text.trim(), 10) - 1; // Convert 1-based to 0-based
+    if (idx >= 0 && idx < results.length) {
+      console.log(`[Scout] LLM picked URL #${idx + 1}: ${results[idx].url}`);
+      return results[idx].url;
+    }
+
+    return results[0].url;
+  } catch (err) {
+    console.warn('[Scout] pickBestUrl failed, using first result:', err);
+    return results[0].url;
+  }
 }
 
 // ============================================================================
@@ -411,7 +456,7 @@ export async function planTaskWithGemini(task: string,wsClient?:WebSocket): Prom
   console.log('[Planner] Starting Pre-Planning Scout phase...');
   sendScoutLog(wsClient, '🔍 Starting Pre-Planning Scout...');
 
-  let scoutContext: null | { query: string, results: SearchResult[] } = null;
+  let scoutUrl: string | null = null;
 
   try {
     // Step 1: Determine if we need to verify URLs
@@ -422,10 +467,9 @@ export async function planTaskWithGemini(task: string,wsClient?:WebSocket): Prom
       sendScoutLog(wsClient, `🔎 URL verification needed. Searching: "${searchQuery}"`);
       const searchResults = await performScout(searchQuery, wsClient);
       if (searchResults.length > 0) {
-        scoutContext = {
-          query: searchQuery,
-          results: searchResults,
-        };
+        // Step 3: LLM picks the best URL from candidates
+        scoutUrl = await pickBestUrl(task, searchResults);
+        sendScoutLog(wsClient, `✓ Selected: ${scoutUrl}`);
       }
     } else {
       console.log('[Scout] ✓ Task uses well-known URLs. Skipping verification.');
@@ -435,7 +479,7 @@ export async function planTaskWithGemini(task: string,wsClient?:WebSocket): Prom
   }
 
   // Format the scout context for injection
-  const scoutContextText = formatScoutContext(scoutContext);
+  const scoutContextText = formatScoutContext(scoutUrl);
   sendScoutLog(wsClient, '📝 Scout phase complete. Generating final plan...');
   // =========================================================================
   // PHASE 2: GENERATE EXECUTION PLAN
@@ -466,10 +510,9 @@ Before planning, determine the task type:
 - Involves forms, carts, payments. May need authentication.
 
 ### INSTRUCTIONS:
-1. **USE VERIFIED CONTEXT (If Provided)**:
-   - If a "VERIFIED CONTEXT FROM GOOGLE SEARCH" section appears above, USE THOSE URLS.
-   - Do NOT invent or guess URLs. If the search results show the correct login page or portal, use that exact URL.
-   - Example: If search shows "UCSD WebReg → https://act.ucsd.edu/webreg2", your first step should be "Navigate to https://act.ucsd.edu/webreg2".
+1. **START URL (If Provided)**:
+   - If a "VERIFIED START URL" section appears above, the agent already navigates there automatically before your steps run.
+   - Do NOT include a "navigate to" step for that URL. Start your steps from the page the user will land on.
 
 2. **MENTAL SIMULATION (The Strategy)**:
    - Before listing steps, "walk through" the website in your head.
@@ -489,16 +532,20 @@ Before planning, determine the task type:
 {
   "strategy": "Your high-level analysis. State the task type (A/B/C) and your reasoning...",
   "needsSynthesis": true,
+  "startUrl": "https://example.com/verified-url (OPTIONAL: The single best starting URL from scout results. Agent navigates here once before steps run.)",
   "steps": [
     {
       "id": 1,
-      "title": "Short Objective (e.g. 'Navigate to WebReg')",
+      "title": "Short Objective (e.g. 'Click on WebReg link')",
       "description": "Detailed visual description of what to look for (e.g. 'Find the search bar center screen').",
-      "needsAuth": false,
-      "targetUrl": "https://example.com/verified-url (OPTIONAL: Only include if you have a VERIFIED URL from the search results above. Do NOT guess URLs.)"
+      "needsAuth": false
     }
   ]
 }
+
+**needsAuth rules:**
+- Set to true ONLY for steps where the user must enter credentials (username/password, SSO login, MFA/OTP).
+- Set to false for ALL other steps, even if they happen on an authenticated page (clicking buttons, selecting dropdowns, viewing content).
 
 **needsSynthesis rules:**
 - Set to TRUE if the user expects information back: research tasks, questions ("tell me", "find out", "how many", "what is", "who is"), comparisons, recommendations, or any task where the user wants an answer — not just a page opened.
@@ -547,8 +594,14 @@ Before planning, determine the task type:
       return heuristicPlan(task);
     }
 
-    // Apply the "[AGENT]" tags if Gemini forgot them
-    return validated.data
+    const plan = validated.data;
+
+    // Override startUrl with the scout-chosen URL — already picked by LLM
+    if (scoutUrl) {
+      plan.startUrl = scoutUrl;
+    }
+
+    return plan;
   } catch(error) {
     console.error('❌ PLANNER ERROR:', error);
     return heuristicPlan(task);
