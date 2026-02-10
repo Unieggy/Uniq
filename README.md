@@ -134,7 +134,7 @@ User (Web UI) ──WebSocket──> Orchestrator ──Playwright──> Browse
 **Example tasks:**
 - "Search for 'ChatGPT' on Google and click the first result"
 - "Go to YouTube and search for OpenAI demos"
-- "Find 红尘客栈 李幸倪 on YouTube and click the video" (multi-language support)
+- "Find 红尘客栈 on YouTube and click the video" (multi-language support)
 - "Find the current menu for Umi restaurant at UCSD"
 - "Research the best 4K monitors under $500" (deep research — visits multiple sources, synthesizes findings)
 - "Navigate to Canvas and check my grades" (triggers auth flow)
