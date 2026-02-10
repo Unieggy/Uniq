@@ -1,4 +1,4 @@
-# Agentic Browser
+# Uniq
 
 An intelligent browser automation system with LLM-powered planning, semantic content detection, vision-based interaction, research synthesis, and real-time WebSocket streaming.
 
